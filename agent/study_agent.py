@@ -1,6 +1,8 @@
 import json
 import os
+import random
 import re
+import time
 
 from openai import OpenAI
 
@@ -11,6 +13,20 @@ from agent.prompts import (
     TOPIC_EXTRACTION_PROMPT,
 )
 from tools.rag import RAGIndex
+
+
+_MAX_RETRIES = 4
+_RETRY_BASE_DELAY = 1.5
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """True for transient server-side conditions: rate limits, overload, timeouts."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in (408, 409, 429, 500, 502, 503, 504):
+        return True
+    return "too_many_concurrent_requests" in str(exc) or "rate_limit" in str(exc)
 
 
 def _strip_thinking(text: str) -> str:
@@ -71,11 +87,26 @@ class StudyBuddyAgent:
         self.max_follow_ups: int = 2
 
     def _complete(self, messages: list) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-        )
-        return resp.choices[0].message.content or ""
+        """Call the LLM, retrying when the endpoint is momentarily saturated.
+
+        The API limits how many requests may be in flight per key, so a shared
+        deployment hits 429 whenever two people answer at the same time. Those
+        are transient, so back off and retry instead of failing the session.
+        """
+        delay = _RETRY_BASE_DELAY
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                )
+                return resp.choices[0].message.content or ""
+            except Exception as e:
+                if attempt == _MAX_RETRIES - 1 or not _is_retryable(e):
+                    raise
+                time.sleep(delay + random.uniform(0, 0.4))
+                delay *= 2
+        return ""  # unreachable: the loop either returns or raises
 
     def extract_topics(self) -> list[str]:
         sample = _sample_text(self.text)

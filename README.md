@@ -2,7 +2,7 @@
 
 An AI-powered study assistant that quizzes you on your own lecture materials using RAG and LLM feedback.
 
-**[▶ Try the live app](https://study-buddy-ibrahim-zarouri.streamlit.app)** · **[Project website](https://ibrahimzarouri.github.io/study-buddy/)** · **[Technical documentation](DOCUMENTATION.md)**
+**[▶ Try the live app](https://studybuddy-ibrahim-zarouri.streamlit.app)** · **[Project website](https://ibrahimzarouri.github.io/study-buddy/)** · **[Technical documentation](DOCUMENTATION.md)**
 
 No setup needed to try it: open the live app, upload a lecture PDF, and start explaining.
 

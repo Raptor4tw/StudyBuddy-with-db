@@ -9,6 +9,14 @@ from tools.rag import RAGIndex
 
 load_dotenv()
 
+# On Streamlit Community Cloud there is no .env file - credentials come from st.secrets.
+# Mirror them into the environment so os.getenv() works the same locally and in the cloud.
+try:
+    for _key, _value in st.secrets.items():
+        os.environ.setdefault(_key, str(_value))
+except Exception:
+    pass  # No secrets.toml configured (normal for local and Docker runs)
+
 st.set_page_config(page_title="StudyBuddy", page_icon="📚", layout="wide")
 
 # ── Session state ─────────────────────────────────────────────────────────────

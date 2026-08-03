@@ -15,13 +15,30 @@ def chunk_text(text: str, size: int = 600, overlap: int = 80) -> List[str]:
     return chunks
 
 
+_MODEL = None
+
+
+def _get_model():
+    """Load the embedding model once per process.
+
+    Every RAGIndex used to load its own copy, which is wasteful locally and
+    exceeds the memory limit of a shared cloud host once several sessions
+    are open at the same time.
+    """
+    global _MODEL
+    if _MODEL is None:
+        from sentence_transformers import SentenceTransformer
+
+        _MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+    return _MODEL
+
+
 class RAGIndex:
     def __init__(self, text: str):
-        from sentence_transformers import SentenceTransformer
         import faiss
 
         self.chunks = chunk_text(text)
-        self._model = SentenceTransformer("all-MiniLM-L6-v2")
+        self._model = _get_model()
 
         emb = self._model.encode(
             self.chunks, show_progress_bar=False, normalize_embeddings=True

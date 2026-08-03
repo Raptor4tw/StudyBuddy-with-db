@@ -2,6 +2,10 @@
 
 An AI-powered study assistant that quizzes you on your own lecture materials using RAG and LLM feedback.
 
+**[▶ Try the live app](https://study-buddy-ibrahim-zarouri.streamlit.app)** · **[Project website](https://ibrahimzarouri.github.io/study-buddy/)** · **[Technical documentation](DOCUMENTATION.md)**
+
+No setup needed to try it: open the live app, upload a lecture PDF, and start explaining.
+
 ## How it works
 
 1. Upload your lecture notes or slides (PDF, Word, or plain text)
@@ -85,6 +89,24 @@ docker run --env-file .env -p 8501:8501 studybuddy
 ```
 
 > The first build downloads the ML dependencies and the embedding model, so it can take several minutes. Later builds reuse the cache and are fast.
+
+## Deploy your own
+
+The app is deployed on [Streamlit Community Cloud](https://share.streamlit.io), which runs the Python backend directly from this repository. (GitHub Pages hosts only static files and cannot run Streamlit, so it serves the project website in `docs/` instead.)
+
+1. Fork this repository.
+2. Go to [share.streamlit.io](https://share.streamlit.io) and choose **Create app**, then pick your fork, branch `main`, and main file `app.py`.
+3. Under **Advanced settings**, paste your credentials into **Secrets**:
+
+   ```toml
+   API_KEY = "your-api-key"
+   BASE_URL = "https://chat.kiconnect.nrw/api/v1"
+   MODEL = "OpenAI-GPT-5-Mini"
+   ```
+
+4. Click **Deploy**.
+
+Secrets set here are read via `st.secrets` and mirrored into the environment at startup, so the same code runs unchanged locally (`.env`), in Docker (`--env-file`), and in the cloud. The first start takes a few minutes because the embedding model is downloaded once.
 
 ## Running tests
 

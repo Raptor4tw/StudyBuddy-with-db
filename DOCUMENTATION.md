@@ -45,6 +45,10 @@ Study-buddy/
 ├── tests/
 │   ├── test_study_agent.py # Unit tests for parsing, sampling, concept matching
 │   └── test_tools.py       # Unit tests for chunking and document loading
+├── docs/
+│   └── index.html          # Project website (served via GitHub Pages)
+├── .streamlit/
+│   └── config.toml         # Upload limit and telemetry settings
 ├── conftest.py             # Pytest path configuration
 ├── requirements.txt
 ├── Dockerfile              # Container image (CPU-only torch, model baked in)

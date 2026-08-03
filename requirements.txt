@@ -1,3 +1,8 @@
+# CPU-only PyTorch: the default Linux torch wheel bundles CUDA and is several GB,
+# which exceeds the build limits of Streamlit Community Cloud.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+
 openai>=1.54.0
 streamlit>=1.40.0,<1.58  # 1.58 replaced the classic default chat avatars
 python-dotenv>=1.0.0

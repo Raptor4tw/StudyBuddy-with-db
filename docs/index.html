@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StudyBuddy - An AI learning partner that quizzes you on your own lecture material</title>
+<meta name="description" content="Upload your lecture slides and explain them back. StudyBuddy asks comprehension questions grounded strictly in your material and keeps digging until every key concept is explained.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>">
+<style>
+  :root{
+    --bg:#ffffff; --bg-alt:#f7f6fc; --fg:#15131f; --fg-mut:#605a75;
+    --line:#e5e2f0; --brand:#6C5CE7; --brand-dk:#5341d6; --code-bg:#f3f1fb;
+    --card:#ffffff; --shadow:0 1px 3px rgba(28,20,60,.07),0 8px 24px rgba(28,20,60,.06);
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0f0d17; --bg-alt:#161327; --fg:#eceaf6; --fg-mut:#a29cbb;
+      --line:#282343; --brand:#9d8bff; --brand-dk:#6C5CE7; --code-bg:#1b1730;
+      --card:#151228; --shadow:0 1px 3px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.3);
+    }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:960px;margin:0 auto;padding:0 24px}
+  a{color:var(--brand);text-decoration:none}
+  a:hover{text-decoration:underline}
+  h1,h2,h3{line-height:1.25;letter-spacing:-.02em;margin:0}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em;
+       background:var(--code-bg);padding:.15em .4em;border-radius:4px}
+
+  /* Hero */
+  header{padding:88px 0 64px;border-bottom:1px solid var(--line);
+         background:linear-gradient(180deg,var(--bg-alt),var(--bg))}
+  .eyebrow{font-size:13px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;
+           color:var(--brand);margin-bottom:18px}
+  h1{font-size:clamp(34px,6vw,54px);margin-bottom:18px}
+  .tagline{font-size:clamp(17px,2.4vw,21px);color:var(--fg-mut);max-width:660px;margin-bottom:34px}
+  .cta{display:flex;gap:12px;flex-wrap:wrap}
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:12px 22px;border-radius:9px;
+       font-weight:600;font-size:15px;border:1px solid var(--line);background:var(--card);
+       color:var(--fg);transition:transform .15s ease,box-shadow .15s ease}
+  .btn:hover{text-decoration:none;transform:translateY(-1px);box-shadow:var(--shadow)}
+  .btn.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+  .btn.primary:hover{background:var(--brand-dk);border-color:var(--brand-dk)}
+
+  section{padding:64px 0;border-bottom:1px solid var(--line)}
+  section h2{font-size:clamp(24px,3.4vw,32px);margin-bottom:14px}
+  .lead{color:var(--fg-mut);max-width:690px;margin-bottom:34px}
+
+  .grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(255px,1fr))}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:22px}
+  .card h3{font-size:16px;margin-bottom:8px}
+  .card p{margin:0;color:var(--fg-mut);font-size:14.5px}
+
+  /* Pipeline */
+  .flow{display:flex;flex-wrap:wrap;gap:12px;align-items:stretch;margin-bottom:14px}
+  .step{flex:1 1 165px;background:var(--card);border:1px solid var(--line);
+        border-left:3px solid var(--brand);border-radius:10px;padding:16px}
+  .step .n{font-size:11px;font-weight:700;letter-spacing:.08em;color:var(--brand);
+           text-transform:uppercase;display:block;margin-bottom:6px}
+  .step strong{display:block;font-size:14.5px;margin-bottom:4px}
+  .step span.d{font-size:13.5px;color:var(--fg-mut)}
+  .loop{font-size:13.5px;color:var(--fg-mut);background:var(--bg-alt);border:1px dashed var(--line);
+        border-radius:9px;padding:12px 16px}
+
+  table{width:100%;border-collapse:collapse;font-size:14.5px}
+  .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  th,td{text-align:left;padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-size:12.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--fg-mut);
+     font-weight:600;white-space:nowrap}
+  td:first-child{font-weight:600;white-space:nowrap}
+
+  ul.q{list-style:none;padding:0;margin:0;display:grid;gap:9px}
+  ul.q li{background:var(--card);border:1px solid var(--line);border-radius:9px;
+          padding:11px 15px;font-size:14.5px}
+
+  .stack{display:flex;flex-wrap:wrap;gap:9px}
+  .pill{font-size:13.5px;padding:6px 13px;border-radius:99px;border:1px solid var(--line);
+        background:var(--bg-alt);color:var(--fg-mut)}
+
+  .note{background:var(--bg-alt);border:1px solid var(--line);border-left:3px solid var(--brand);
+        border-radius:9px;padding:16px 18px;font-size:14.5px;color:var(--fg-mut)}
+  .note strong{color:var(--fg)}
+
+  /* Mastery loop */
+  .cycle{display:grid;gap:11px;padding:0;margin:0;list-style:none;counter-reset:c}
+  .cycle li{counter-increment:c;display:flex;gap:14px;align-items:flex-start;
+            background:var(--card);border:1px solid var(--line);border-radius:10px;padding:15px 18px}
+  .cycle li::before{content:counter(c);flex:none;width:26px;height:26px;border-radius:50%;
+        background:var(--brand);color:#fff;font-size:13px;font-weight:700;
+        display:grid;place-items:center;margin-top:1px}
+  .cycle strong{display:block;font-size:14.5px}
+  .cycle span{font-size:13.5px;color:var(--fg-mut)}
+
+  footer{padding:44px 0 60px;color:var(--fg-mut);font-size:14px}
+  footer a{font-weight:600}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="eyebrow">Master's Project · Institute for Internet Security</div>
+    <h1>StudyBuddy</h1>
+    <p class="tagline">
+      An AI learning partner that quizzes you on your own lecture material. Upload your slides,
+      explain a concept in your own words, and get grounded feedback plus a sharper follow-up
+      question, until every key concept of the topic has actually been explained.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://study-buddy-ibrahim-zarouri.streamlit.app">▶ Try the live app</a>
+      <a class="btn" href="https://github.com/ibrahimzarouri/study-buddy">View source on GitHub</a>
+      <a class="btn" href="https://github.com/ibrahimzarouri/study-buddy/blob/main/DOCUMENTATION.md">Technical documentation</a>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>The problem</h2>
+    <p class="lead">
+      Re-reading slides feels productive and proves nothing. You recognise the material without
+      being able to explain it, and you only discover the gap in the exam. Asking a general
+      chatbot does not help either: it answers from the internet, not from the course, so it
+      cannot tell you whether <em>you</em> have understood what <em>your lecturer</em> actually taught.
+    </p>
+    <h2>The approach</h2>
+    <p class="lead">
+      StudyBuddy turns the material itself into the examiner. It reads your uploaded document,
+      derives the topics and the key concepts behind each one, and then runs a Socratic dialogue:
+      it asks, you explain, it evaluates against the material and digs into the weakest spot.
+      A topic counts as mastered only once every key concept has been explained by you.
+    </p>
+    <div class="note">
+      <strong>Grounded, not generic.</strong> Every question and every evaluation is generated
+      from retrieved passages of your own document, with an explicit instruction never to fall
+      back on general knowledge. If it is not in your slides, StudyBuddy will not ask about it.
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What it does</h2>
+    <div class="grid">
+      <div class="card"><h3>Your material is the syllabus</h3>
+        <p>Questions come from retrieved passages of the uploaded document only, so you are tested on the course rather than on the internet.</p></div>
+      <div class="card"><h3>Mastery is defined, not guessed</h3>
+        <p>Each topic is broken into 3 to 5 key concepts. The checklist is visible, and the topic closes only when all of them are covered.</p></div>
+      <div class="card"><h3>Follow-ups that target the gap</h3>
+        <p>A weak answer produces a single focused follow-up on the biggest gap, not a rephrasing of the same question.</p></div>
+      <div class="card"><h3>Speaks the material's language</h3>
+        <p>German slides produce German topics, questions and feedback. The language is inherited from the document, never configured.</p></div>
+      <div class="card"><h3>No dead ends</h3>
+        <p>After two follow-ups on one question the agent stops drilling and retries the concept from a fresh angle instead of looping.</p></div>
+      <div class="card"><h3>Visible progress</h3>
+        <p>A progress bar and a concept checklist show exactly what you have proven and what is still open.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>How it works</h2>
+    <p class="lead">
+      One upload, four prompt types, and a vector index over your document. No agent framework:
+      the pipeline is a short fixed sequence of LLM calls, which keeps it transparent and debuggable.
+    </p>
+    <div class="flow">
+      <div class="step"><span class="n">Step 1</span><strong>Parse</strong>
+        <span class="d">PDF, DOCX or TXT is converted to plain text; unparseable files are rejected up front.</span></div>
+      <div class="step"><span class="n">Step 2</span><strong>Index</strong>
+        <span class="d">Text is chunked, embedded with <code>all-MiniLM-L6-v2</code> and stored in a FAISS index for retrieval.</span></div>
+      <div class="step"><span class="n">Step 3</span><strong>Extract topics</strong>
+        <span class="d">Samples from the start, middle and end of the document yield the main topics.</span></div>
+      <div class="step"><span class="n">Step 4</span><strong>Derive concepts</strong>
+        <span class="d">The chosen topic is turned into a checklist of key concepts you must be able to explain.</span></div>
+      <div class="step"><span class="n">Step 5</span><strong>Ask and evaluate</strong>
+        <span class="d">One focused question per concept; your answer is graded against retrieved context as structured JSON.</span></div>
+    </div>
+    <div class="loop">
+      <strong>↺ The mastery loop:</strong> each evaluation returns which concepts your answer genuinely
+      covered, and those get ticked off. Remaining concepts drive the next question. The loop exits only
+      when the checklist is complete, which is what makes "until the topic is fully explained" a
+      measurable condition rather than a judgement call.
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>A session, end to end</h2>
+    <ol class="cycle">
+      <li><div><strong>Upload</strong><span>Drop in a lecture PDF. Topics appear in the sidebar within seconds.</span></div></li>
+      <li><div><strong>Pick a topic</strong><span>StudyBuddy names the key concepts it will hold you to, then asks the first question.</span></div></li>
+      <li><div><strong>Explain</strong><span>You answer in your own words, in the chat, at whatever length you want.</span></div></li>
+      <li><div><strong>Get graded and pushed</strong><span>Correct, partial or incorrect, with specific feedback and a follow-up aimed at what you missed.</span></div></li>
+      <li><div><strong>Master the topic</strong><span>The checklist fills up. When the last concept is ticked, the topic is done and you move on.</span></div></li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Design decisions</h2>
+    <p class="lead">The choices that shaped the architecture, and the reasoning behind each.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Decision</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>No agent framework</td>
+              <td>The pipeline is a small fixed sequence of LLM calls plus one vector index. Using the OpenAI client and FAISS directly keeps the code transparent, debuggable and dependency-light.</td></tr>
+          <tr><td>Material as ground truth</td>
+              <td>Grounding everything in the uploaded document is what makes the tool useful for exam preparation. The trade-off is deliberate and documented under limitations.</td></tr>
+          <tr><td>Concept checklist as the mastery criterion</td>
+              <td>An explicit, inspectable definition of "fully explained", shown to the student as a checklist, instead of an opaque model judgement.</td></tr>
+          <tr><td>Follow-up limit with retry from a new angle</td>
+              <td>Prevents frustrating dead-end loops on a single question while still refusing to skip a concept that has not been mastered.</td></tr>
+          <tr><td>Tolerant JSON parsing</td>
+              <td>Model output arrives wrapped in code fences, reasoning blocks or prose. The parser strips all of these and falls back to a neutral evaluation, so a malformed response never ends a session.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Built with</h2>
+    <div class="stack">
+      <span class="pill">Python</span>
+      <span class="pill">Streamlit</span>
+      <span class="pill">FAISS</span>
+      <span class="pill">sentence-transformers</span>
+      <span class="pill">pypdf</span>
+      <span class="pill">python-docx</span>
+      <span class="pill">OpenAI-compatible LLM API</span>
+      <span class="pill">Docker</span>
+      <span class="pill">pytest</span>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Run it yourself</h2>
+    <p class="lead">
+      The repository ships setup instructions, a Dockerfile and a unit test suite.
+      Any OpenAI-compatible endpoint works; no vendor lock-in.
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Route</th><th>Command</th></tr></thead>
+        <tbody>
+          <tr><td>Local</td><td><code>pip install -r requirements.txt</code> then <code>streamlit run app.py</code></td></tr>
+          <tr><td>Docker</td><td><code>docker build -t studybuddy .</code> then <code>docker run --env-file .env -p 8501:8501 studybuddy</code></td></tr>
+          <tr><td>Cloud</td><td>Fork the repository and deploy it on Streamlit Community Cloud (see README)</td></tr>
+          <tr><td>Tests</td><td><code>python -m pytest tests/ -v</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>
+      <strong>Ahmad Morad · Ibrahim Zarouri · Ibrahim Shaban</strong><br>
+      Master's project, Westphalian University of Applied Sciences, Institute for Internet Security.<br>
+      Supervisor: Prof. Dr.-Ing. Tobias Urban<br><br>
+      <a href="https://study-buddy-ibrahim-zarouri.streamlit.app">Live app</a> ·
+      <a href="https://github.com/ibrahimzarouri/study-buddy">Source code</a> ·
+      <a href="https://github.com/ibrahimzarouri/study-buddy/blob/main/DOCUMENTATION.md">Documentation</a>
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

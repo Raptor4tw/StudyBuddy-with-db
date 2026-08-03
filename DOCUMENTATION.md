@@ -194,19 +194,11 @@ LLM-dependent behavior (question quality, evaluation accuracy) is validated manu
 ## 8. Design Decisions
 
 - **No agent framework (LangChain etc.)** - the pipeline is a small, fixed sequence of LLM calls plus one vector index. Direct use of the OpenAI client and FAISS keeps the code transparent, debuggable, and dependency-light.
-- **Material as ground truth** - grounding everything in the uploaded document is what makes the tool useful for exam preparation (it tests *the course*, not the internet). The trade-off is deliberate: see limitations.
+- **Material as ground truth** - grounding everything in the uploaded document is what makes the tool useful for exam preparation (it tests *the course*, not the internet).
 - **Concept checklist as mastery criterion** - an explicit, inspectable definition of "topic fully explained", visible to the student as a progress bar and checklist, rather than an opaque LLM judgment.
 - **Follow-up limit with retry-from-new-angle** - prevents frustrating dead-end loops on a single question while still refusing to skip unmastered concepts.
 
-## 9. Known Limitations
-
-- **Errors in the material are defended.** The evaluator treats the lecture material as ground truth by design; if a slide contains a typo (e.g., a wrong constant), StudyBuddy will initially challenge a factually correct student answer. In practice the dialogue lets students reconcile such conflicts, but the behavior should be understood.
-- **No session persistence.** A browser refresh discards the session (Streamlit `session_state` is per-connection). Progress is not saved between visits.
-- **One document at a time.** Uploading a new file replaces the previous index; topics cannot span multiple documents yet.
-- **Re-uploading a file with the same name** but changed content is not detected (only the filename is compared).
-- **PDF text extraction quality** depends on the source document; scanned (image-only) PDFs yield no text since no OCR is performed.
-
-## 10. Future Work
+## 9. Future Work
 
 - Session persistence and per-student progress history
 - End-of-session learning summary ("mastered X, review Y") and export

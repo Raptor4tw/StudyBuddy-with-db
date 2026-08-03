@@ -124,4 +124,4 @@ python -m pytest tests/ -v
 
 ## Documentation
 
-See [DOCUMENTATION.md](DOCUMENTATION.md) for the technical documentation: architecture, processing pipeline, prompt design, testing, design decisions, and known limitations.
+See [DOCUMENTATION.md](DOCUMENTATION.md) for the technical documentation: architecture, processing pipeline, prompt design, testing, and design decisions.

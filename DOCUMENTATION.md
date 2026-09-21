@@ -97,6 +97,13 @@ Study-buddy/
 
 Conversation history, the agent instance, and all state live in `st.session_state`.
 
+The sidebar also keeps a **review list** (`st.session_state.mistakes`): every question
+scored `partial` or `incorrect` is recorded with the topic, the student's answer, and the
+concept the evaluator flagged as missing. Unlike the conversation, it is not cleared when
+the topic changes or restarts - it accumulates across the whole document so the student
+can see everything still worth revisiting. It resets only when a new document is uploaded
+or when "Clear review list" is pressed.
+
 ---
 
 ## 4. The Agent (`agent/study_agent.py`)

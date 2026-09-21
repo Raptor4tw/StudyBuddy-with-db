@@ -14,6 +14,10 @@ No setup needed to try it: open the live app, upload a lecture PDF, and start ex
 4. Explain the concept in your own words
 5. Get instant feedback and targeted follow-up questions until the topic is mastered
 
+Anything you answer only partially or get wrong is collected in a **review list** in the
+sidebar - with the question, your answer, and the concept you missed - so you can come
+back to it after moving on to other topics.
+
 ## Setup
 
 ### 1. Clone the repository

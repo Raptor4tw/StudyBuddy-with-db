@@ -6,18 +6,37 @@ from dotenv import load_dotenv
 from agent.study_agent import StudyBuddyAgent
 from tools.document_loader import load_document
 from tools.rag import RAGIndex
+from auth import init_db
+from auth_ui import require_login, logout
+import history
 
 load_dotenv()
 
-# On Streamlit Community Cloud there is no .env file - credentials come from st.secrets.
-# Mirror them into the environment so os.getenv() works the same locally and in the cloud.
 try:
     for _key, _value in st.secrets.items():
         os.environ.setdefault(_key, str(_value))
 except Exception:
-    pass  # No secrets.toml configured (normal for local and Docker runs)
+    pass
 
 st.set_page_config(page_title="StudyBuddy", page_icon="📚", layout="wide")
+
+st.markdown("""
+<style>
+    section[data-testid="stSidebar"] button {
+        text-align: left;
+        justify-content: flex-start;
+    }
+    div[data-testid="stChatMessage"] {
+        border-radius: 10px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+init_db()
+user = st.session_state.get("user") or require_login()
+if user is None:
+    st.stop()
+st.session_state["user"] = user
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -25,13 +44,32 @@ for _k, _v in {
     "agent": None,
     "topics": [],
     "conversation": [],
-    "app_state": "upload",   # upload | topic_select | questioning | feedback | mastered
+    "app_state": "upload",
     "last_filename": None,
     "celebrate": False,
-    "mistakes": [],          # questions answered partially or incorrectly, across topics
+    "mistakes_by_user": {},
+    "document_text": None,
+    "current_session_id": None,
 }.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
+
+
+def _persist():
+    """Save the current conversation/mistakes/concepts to the active session row."""
+    if not st.session_state.current_session_id or not st.session_state.agent:
+        return
+    agent = st.session_state.agent
+    history.update_session(
+        st.session_state.current_session_id,
+        user["id"],
+        agent.concepts,
+        st.session_state.conversation,
+        st.session_state.mistakes_by_user.get(user["id"], []),
+        agent.current_concept,
+        agent.current_question,
+        agent.follow_up_count,
+    )
 
 
 def _load_file(uploaded_file):
@@ -44,7 +82,9 @@ def _load_file(uploaded_file):
     st.session_state.agent = agent
     st.session_state.topics = topics
     st.session_state.conversation = []
-    st.session_state.mistakes = []
+    st.session_state.mistakes_by_user[user["id"]] = []
+    st.session_state.document_text = text
+    st.session_state.current_session_id = None
     st.session_state.app_state = "topic_select"
     st.session_state.last_filename = uploaded_file.name
     return len(text), topics
@@ -67,6 +107,51 @@ def _select_topic(topic: str):
         {"role": "assistant", "content": question, "type": "question"},
     ]
     st.session_state.app_state = "questioning"
+    st.session_state.current_session_id = history.create_session(
+        user["id"],
+        st.session_state.last_filename,
+        st.session_state.document_text,
+        topic,
+        agent.concepts,
+        st.session_state.conversation,
+        st.session_state.mistakes_by_user.get(user["id"], []),
+        agent.current_concept,
+        agent.current_question,
+        agent.follow_up_count,
+    )
+
+
+def _resume_session(session_id: int):
+    """Rebuild an agent + conversation from a previously saved session."""
+    saved = history.load_session(session_id, user["id"])
+    if saved is None:
+        st.error("Could not find that saved session.")
+        return
+
+    rag = RAGIndex(saved["document_text"])
+    agent = StudyBuddyAgent(saved["document_text"], rag)
+    agent.concepts = saved["concepts"]
+    agent.current_topic = saved["topic"]
+    agent.current_concept = saved["current_concept"]
+    agent.current_question = saved["current_question"]
+    agent.follow_up_count = saved["follow_up_count"]
+    agent.asked_questions = [
+        m["content"] for m in saved["conversation"] if m["type"] == "question"
+    ]
+
+    st.session_state.agent = agent
+    st.session_state.topics = [saved["topic"]]
+    st.session_state.conversation = saved["conversation"]
+    st.session_state.mistakes_by_user[user["id"]] = saved["mistakes"]
+    st.session_state.document_text = saved["document_text"]
+    st.session_state.last_filename = saved["document_name"]
+    st.session_state.current_session_id = session_id
+
+    if agent.topic_complete:
+        st.session_state.app_state = "mastered"
+    else:
+        last_type = saved["conversation"][-1]["type"] if saved["conversation"] else None
+        st.session_state.app_state = "questioning" if last_type == "question" else "feedback"
 
 
 def _render_progress():
@@ -103,10 +188,10 @@ def _render_conversation():
 
 
 def _render_mistakes():
-    mistakes = st.session_state.mistakes
+    mistakes = st.session_state.mistakes_by_user.get(user["id"], [])
     if not mistakes:
+        st.caption("No mistakes recorded yet.")
         return
-    st.divider()
     with st.expander(f"❌ Review ({len(mistakes)})"):
         for i, m in enumerate(mistakes, 1):
             answer = m["answer"]
@@ -120,15 +205,24 @@ def _render_mistakes():
             if i < len(mistakes):
                 st.divider()
         if st.button("Clear review list", key="clear_mistakes", use_container_width=True):
-            st.session_state.mistakes = []
+            st.session_state.mistakes_by_user[user["id"]] = []
+            _persist()
             st.rerun()
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.title("📚 StudyBuddy")
-    st.caption("AI Learning Partner")
+    header_col1, header_col2 = st.columns([3, 2])
+    with header_col1:
+        st.markdown("### 📚 StudyBuddy")
+        st.caption("AI Learning Partner")
+    with header_col2:
+        st.caption(f"👤 {user['username']}")
+        if st.button("Log out", use_container_width=True):
+            logout()
+            st.rerun()
+
     st.divider()
 
     uploaded = st.file_uploader(
@@ -141,25 +235,47 @@ with st.sidebar:
         with st.spinner("Processing document…"):
             try:
                 chars, topics = _load_file(uploaded)
-                st.success(f"Loaded {chars:,} characters · {len(topics)} topics found")
+                st.success(f"{chars:,} characters · {len(topics)} topics found", icon="✅")
             except Exception as e:
                 st.error(f"Error: {e}")
                 st.session_state.last_filename = None
 
-    if st.session_state.topics:
-        st.divider()
-        st.subheader("Topics")
-        for topic in st.session_state.topics:
-            if st.button(topic, key=f"btn_{topic}", use_container_width=True):
-                with st.spinner("Preparing first question…"):
-                    try:
-                        _select_topic(topic)
-                    except Exception as e:
-                        st.error(f"Could not start topic: {e}")
-                    else:
-                        st.rerun()
+    st.divider()
 
-    _render_mistakes()
+    tab_topics, tab_history, tab_review = st.tabs(["📖 Topics", "🕘 History", "❌ Review"])
+
+    with tab_topics:
+        if st.session_state.topics:
+            for topic in st.session_state.topics:
+                if st.button(topic, key=f"btn_{topic}", use_container_width=True):
+                    with st.spinner("Preparing first question…"):
+                        try:
+                            _select_topic(topic)
+                        except Exception as e:
+                            st.error(f"Could not start topic: {e}")
+                        else:
+                            st.rerun()
+        else:
+            st.caption("Upload a document to see topics here.")
+
+    with tab_history:
+        sessions = history.list_sessions(user["id"])
+        if not sessions:
+            st.caption("No past sessions yet.")
+        for s in sessions:
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                label = f"{s['document_name']} · {s['topic']}"
+                if st.button(label, key=f"resume_{s['id']}", use_container_width=True):
+                    _resume_session(s["id"])
+                    st.rerun()
+            with col2:
+                if st.button("🗑️", key=f"delete_{s['id']}"):
+                    history.delete_session(s["id"], user["id"])
+                    st.rerun()
+
+    with tab_review:
+        _render_mistakes()
 
     st.divider()
     st.caption(f"Model: {os.getenv('MODEL', 'not configured')}")
@@ -184,7 +300,7 @@ if state == "upload":
 """)
 
 elif state == "topic_select":
-    st.info("Please choose a topic from the **Topics** list in the sidebar to start a session.")
+    st.info("Please choose a topic from the **Topics** tab in the sidebar to start a session.")
 
 elif state in ("questioning", "feedback", "mastered"):
     _render_progress()
@@ -196,8 +312,6 @@ elif state in ("questioning", "feedback", "mastered"):
             st.session_state.conversation.append(
                 {"role": "user", "content": answer, "type": "answer"}
             )
-            # evaluate_answer() replaces current_question with the follow-up, so the
-            # question actually answered has to be captured before the call.
             asked_question = st.session_state.agent.current_question
             with st.spinner("Evaluating your answer…"):
                 try:
@@ -213,7 +327,7 @@ elif state in ("questioning", "feedback", "mastered"):
             follow_up = result.get("follow_up")
 
             if score in ("partial", "incorrect"):
-                st.session_state.mistakes.append(
+                st.session_state.mistakes_by_user.setdefault(user["id"], []).append(
                     {
                         "topic": agent.current_topic,
                         "question": asked_question,
@@ -260,10 +374,8 @@ elif state in ("questioning", "feedback", "mastered"):
                 st.session_state.conversation.append(
                     {"role": "assistant", "content": follow_up, "type": "question"}
                 )
-                # Stay in "questioning" — follow_up is now the active question
 
             else:
-                # Max follow-ups reached — retry the concept from a fresh angle
                 st.session_state.conversation.append(
                     {
                         "role": "assistant",
@@ -274,6 +386,7 @@ elif state in ("questioning", "feedback", "mastered"):
                 )
                 st.session_state.app_state = "feedback"
 
+            _persist()
             st.rerun()
 
     elif state == "feedback":
@@ -290,11 +403,13 @@ elif state in ("questioning", "feedback", "mastered"):
                     {"role": "assistant", "content": q, "type": "question"}
                 )
                 st.session_state.app_state = "questioning"
+                _persist()
                 st.rerun()
         with col2:
             if st.button("Change Topic", use_container_width=True):
                 st.session_state.conversation = []
                 st.session_state.app_state = "topic_select"
+                st.session_state.current_session_id = None
                 st.rerun()
         with col3:
             if st.button("Restart Topic", use_container_width=True):
@@ -317,6 +432,7 @@ elif state in ("questioning", "feedback", "mastered"):
             if st.button("Choose Next Topic →", type="primary", use_container_width=True):
                 st.session_state.conversation = []
                 st.session_state.app_state = "topic_select"
+                st.session_state.current_session_id = None
                 st.rerun()
         with col2:
             if st.button("Restart This Topic", use_container_width=True):

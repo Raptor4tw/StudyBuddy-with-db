@@ -231,7 +231,7 @@ This section records who developed which parts of the project. The code contribu
 |------|-------|
 | Review list that collects partially or incorrectly answered questions and shows them in the sidebar | `app.py` (`_render_mistakes` and the mistake recording in the evaluation flow) |
 
-Contributed as a pull request.
+Contributed as a pull request and merged into this repository. The commit is authored under his name in the history.
 
 ### Ahmad Morad
 

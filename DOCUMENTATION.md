@@ -198,7 +198,41 @@ LLM-dependent behavior (question quality, evaluation accuracy) is validated manu
 - **Concept checklist as mastery criterion** - an explicit, inspectable definition of "topic fully explained", visible to the student as a progress bar and checklist, rather than an opaque LLM judgment.
 - **Follow-up limit with retry-from-new-angle** - prevents frustrating dead-end loops on a single question while still refusing to skip unmastered concepts.
 
-## 9. Future Work
+## 9. Contributions
+
+This section records who developed which parts of the project. The code contributions can be verified against the commit history with `git log`.
+
+### Ibrahim Zarouri
+
+| Area | Files |
+|------|-------|
+| Document processing (PDF, DOCX, TXT) | `tools/document_loader.py` |
+| RAG pipeline: chunking, embeddings, FAISS index | `tools/rag.py` |
+| Agent: topic and concept extraction, question generation, answer evaluation, mastery tracking, retry on rate limits | `agent/study_agent.py` |
+| Prompt design | `agent/prompts.py` |
+| Streamlit UI and application state machine | `app.py` |
+| Unit test suite (22 tests) | `tests/`, `conftest.py` |
+| Docker setup | `Dockerfile`, `docker-compose.yml`, `.dockerignore` |
+| Streamlit Cloud deployment | `.streamlit/config.toml`, `requirements.txt` |
+| Project website | `docs/index.html` |
+| Dev container | `.devcontainer/devcontainer.json` |
+| Documentation | `README.md`, `DOCUMENTATION.md` |
+
+### Ibrahim Shaban
+
+| Area | Files |
+|------|-------|
+| Review list that collects partially or incorrectly answered questions and shows them in the sidebar | `app.py` (`_render_mistakes` and the mistake recording in the evaluation flow) |
+
+Contributed as a pull request.
+
+### Ahmad Morad
+
+| Area | Files |
+|------|-------|
+| Testing of the application | - |
+
+## 10. Future Work
 
 - Session persistence and per-student progress history
 - End-of-session learning summary ("mastered X, review Y") and export

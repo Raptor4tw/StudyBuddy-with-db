@@ -237,11 +237,20 @@ Contributed as a pull request and merged into this repository. The commit is aut
 
 | Area | Files |
 |------|-------|
-| Testing of the application | - |
+| Multi-user authentication: signup, login, bcrypt password hashing, input validation | `auth.py`, `auth_ui.py` |
+| Persistent login sessions (cookie-based, survives new tabs and browser restarts) | `auth.py`, `auth_ui.py` |
+| Database schema for users and persistent login sessions | `schema.sql` |
+| Per-user study session persistence (resume, delete past sessions across topics/documents) | `history.py`, `schema.sql` |
+| Wiring authentication and session history into the application state machine, scoping the review list per user | `app.py` |
+| Sidebar restyle (tabbed Topics / History / Review, custom theme) | `app.py`, `.streamlit/config.toml` |
+| Unit tests for the answer-evaluation state machine (mocked LLM responses covering correct, partial, incorrect/off-topic, follow-up limits, malformed-response fallback) | `tests/test_evaluation_state_machine.py` |
+| GitLab CI pipeline running the test suite on every push and merge request | `.gitlab-ci.yml` |
+| Environment configuration for authentication | `.env.example`, `requirements.txt` |
+
+Contributed via commits to this repository, verifiable against `git log`.
 
 ## 10. Future Work
 
-- Session persistence and per-student progress history
 - End-of-session learning summary ("mastered X, review Y") and export
 - Multi-document support (whole-course index)
 - CI pipeline running the test suite on every push

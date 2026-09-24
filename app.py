@@ -50,9 +50,24 @@ for _k, _v in {
     "mistakes_by_user": {},
     "document_text": None,
     "current_session_id": None,
+    "pending_topic": None,
+    "_uploader_had_file": False,
+    "_uploader_key": 0,
+    "session_is_pending": False,
 }.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
+
+PENDING_TOPIC_LABEL = "Uploaded – choose a topic"
+
+
+def _get_mistakes() -> list:
+    """Mistakes scoped by (user, current document) — never shared across unrelated PDFs."""
+    return st.session_state.mistakes_by_user.get(user["id"], {}).get(st.session_state.last_filename, [])
+
+
+def _set_mistakes(mistakes: list) -> None:
+    st.session_state.mistakes_by_user.setdefault(user["id"], {})[st.session_state.last_filename] = mistakes
 
 
 def _persist():
@@ -65,7 +80,7 @@ def _persist():
         user["id"],
         agent.concepts,
         st.session_state.conversation,
-        st.session_state.mistakes_by_user.get(user["id"], []),
+        _get_mistakes(),
         agent.current_concept,
         agent.current_question,
         agent.follow_up_count,
@@ -79,14 +94,33 @@ def _load_file(uploaded_file):
     rag = RAGIndex(text)
     agent = StudyBuddyAgent(text, rag)
     topics = agent.extract_topics()
+
+    hidden = history.get_hidden_topics(user["id"], uploaded_file.name)
+    topics = [t for t in topics if t not in hidden]
+
     st.session_state.agent = agent
     st.session_state.topics = topics
     st.session_state.conversation = []
-    st.session_state.mistakes_by_user[user["id"]] = []
     st.session_state.document_text = text
-    st.session_state.current_session_id = None
     st.session_state.app_state = "topic_select"
     st.session_state.last_filename = uploaded_file.name
+    _set_mistakes([])
+
+    st.session_state.current_session_id = history.create_session(
+        user["id"],
+        uploaded_file.name,
+        text,
+        PENDING_TOPIC_LABEL,
+        topics,
+        {},
+        [],
+        [],
+        None,
+        None,
+        0,
+    )
+    st.session_state.session_is_pending = True
+
     return len(text), topics
 
 
@@ -107,19 +141,36 @@ def _select_topic(topic: str):
         {"role": "assistant", "content": question, "type": "question"},
     ]
     st.session_state.app_state = "questioning"
-    st.session_state.current_session_id = history.create_session(
-        user["id"],
-        st.session_state.last_filename,
-        st.session_state.document_text,
-        topic,
-        st.session_state.topics,
-        agent.concepts,
-        st.session_state.conversation,
-        st.session_state.mistakes_by_user.get(user["id"], []),
-        agent.current_concept,
-        agent.current_question,
-        agent.follow_up_count,
-    )
+
+    if st.session_state.session_is_pending and st.session_state.current_session_id:
+        # Turn the upload's placeholder row into this topic's real session
+        # instead of creating a duplicate.
+        history.update_session(
+            st.session_state.current_session_id,
+            user["id"],
+            agent.concepts,
+            st.session_state.conversation,
+            _get_mistakes(),
+            agent.current_concept,
+            agent.current_question,
+            agent.follow_up_count,
+            topic=topic,
+        )
+        st.session_state.session_is_pending = False
+    else:
+        st.session_state.current_session_id = history.create_session(
+            user["id"],
+            st.session_state.last_filename,
+            st.session_state.document_text,
+            topic,
+            st.session_state.topics,
+            agent.concepts,
+            st.session_state.conversation,
+            _get_mistakes(),
+            agent.current_concept,
+            agent.current_question,
+            agent.follow_up_count,
+        )
 
 
 def _resume_session(session_id: int):
@@ -141,23 +192,31 @@ def _resume_session(session_id: int):
     ]
 
     st.session_state.agent = agent
-    st.session_state.topics = saved["topics"]
+    st.session_state.document_text = saved["document_text"]
+    st.session_state.last_filename = saved["document_name"]
+    st.session_state.current_session_id = session_id
+    st.session_state.session_is_pending = (saved["topic"] == PENDING_TOPIC_LABEL)
+
+    # Filter out anything hidden for this document — saved["topics"] is a
+    # snapshot from whenever this session was created/updated, and may still
+    # include topics that were deleted afterward.
+    hidden = history.get_hidden_topics(user["id"], saved["document_name"])
+    st.session_state.topics = [t for t in saved["topics"] if t not in hidden]
+
     st.session_state.conversation = saved["conversation"]
 
-    # Merge this session's mistakes into the user's current review list instead of
-    # replacing it outright — dedupe by (topic, question) so re-resuming doesn't duplicate.
-    existing = st.session_state.mistakes_by_user.get(user["id"], [])
+    # Merge this session's mistakes into THIS document's review list — dedupe by
+    # (topic, question) so re-resuming the same session doesn't duplicate entries.
+    existing = _get_mistakes()
     existing_keys = {(m["topic"], m["question"]) for m in existing}
     merged = existing + [
         m for m in saved["mistakes"] if (m["topic"], m["question"]) not in existing_keys
     ]
-    st.session_state.mistakes_by_user[user["id"]] = merged
+    _set_mistakes(merged)
 
-    st.session_state.document_text = saved["document_text"]
-    st.session_state.last_filename = saved["document_name"]
-    st.session_state.current_session_id = session_id
-
-    if agent.topic_complete:
+    if st.session_state.session_is_pending:
+        st.session_state.app_state = "topic_select"
+    elif agent.topic_complete:
         st.session_state.app_state = "mastered"
     else:
         last_type = saved["conversation"][-1]["type"] if saved["conversation"] else None
@@ -198,7 +257,7 @@ def _render_conversation():
 
 
 def _render_mistakes():
-    mistakes = st.session_state.mistakes_by_user.get(user["id"], [])
+    mistakes = _get_mistakes()
     if not mistakes:
         st.caption("No mistakes recorded yet.")
         return
@@ -216,15 +275,30 @@ def _render_mistakes():
                     st.markdown(f"Missing: {m['missing']}")
             with col2:
                 if st.button("🗑️", key=f"delete_mistake_{i}"):
-                    st.session_state.mistakes_by_user[user["id"]].pop(i - 1)
+                    mistakes.pop(i - 1)
+                    _set_mistakes(mistakes)
                     _persist()
                     st.rerun()
             if i < len(mistakes):
                 st.divider()
         if st.button("Clear review list", key="clear_mistakes", use_container_width=True):
-            st.session_state.mistakes_by_user[user["id"]] = []
+            _set_mistakes([])
             _persist()
             st.rerun()
+
+# ── Pending action handler ────────────────────────────────────────────────────
+# Runs BEFORE the sidebar renders, so the slow LLM call in _select_topic() never
+# happens mid-render of a widget-heavy sidebar.
+
+if st.session_state.pending_topic is not None:
+    topic = st.session_state.pending_topic
+    st.session_state.pending_topic = None
+    with st.spinner(f"Preparing first question on **{topic}**…"):
+        try:
+            _select_topic(topic)
+        except Exception as e:
+            st.error(f"Could not start topic: {e}")
+    st.rerun()
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -238,6 +312,12 @@ with st.sidebar:
         st.caption(f"👤 {user['username']}")
         if st.button("Log out", use_container_width=True):
             logout()
+            for key in [
+                "agent", "topics", "conversation", "app_state", "last_filename",
+                "celebrate", "mistakes_by_user", "document_text", "current_session_id",
+                "pending_topic", "_uploader_had_file", "_uploader_key", "session_is_pending",
+            ]:
+                st.session_state.pop(key, None)
             st.rerun()
 
     st.divider()
@@ -246,20 +326,47 @@ with st.sidebar:
         "Upload lecture material",
         type=["pdf", "txt", "docx"],
         help="Supports PDF, plain text, and Word documents",
+        key=f"uploader_{st.session_state._uploader_key}",
     )
 
-    if uploaded and uploaded.name != st.session_state.last_filename:
-        with st.spinner("Processing document…"):
-            try:
-                chars, topics = _load_file(uploaded)
-                st.success(f"{chars:,} characters · {len(topics)} topics found", icon="✅")
-            except Exception as e:
-                st.error(f"Error: {e}")
-                st.session_state.last_filename = None
+    if uploaded is not None:
+        st.session_state._uploader_had_file = True
+        if uploaded.name != st.session_state.last_filename:
+            with st.spinner("Processing document…"):
+                try:
+                    chars, topics = _load_file(uploaded)
+                    st.toast(f"{chars:,} characters · {len(topics)} topics found", icon="✅")
+                    st.session_state._uploader_key += 1
+                    st.session_state._uploader_had_file = False
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                    st.session_state.last_filename = None
+
+    elif st.session_state._uploader_had_file:
+        # The user clicked the uploader's own "✕" to remove the file — clean up
+        # everything tied to that document: its sessions, topics, and review list.
+        removed_doc = st.session_state.last_filename
+        st.session_state._uploader_had_file = False
+
+        if removed_doc:
+            for s in history.list_sessions(user["id"]):
+                if s["document_name"] == removed_doc:
+                    history.delete_session(s["id"], user["id"])
+
+        st.session_state.agent = None
+        st.session_state.topics = []
+        st.session_state.conversation = []
+        st.session_state.document_text = None
+        st.session_state.current_session_id = None
+        st.session_state.session_is_pending = False
+        st.session_state.last_filename = None
+        st.session_state.app_state = "upload"
+        st.rerun()
 
     st.divider()
 
-    tab_topics, tab_history, tab_review = st.tabs(["📖 Topics", "🕘 History", "❌ Review"])
+    tab_topics, tab_review, tab_hidden = st.tabs(["📖 Topics", "❌ Review", "🙈 Hidden"])
 
     with tab_topics:
         if st.session_state.topics:
@@ -267,60 +374,72 @@ with st.sidebar:
                 col1, col2 = st.columns([5, 1])
                 with col1:
                     if st.button(topic, key=f"btn_{topic}", use_container_width=True):
-                        try:
-                            _select_topic(topic)
-                        except Exception as e:
-                            st.error(f"Could not start topic: {e}")
-                        else:
-                            st.rerun()
+                        st.session_state.pending_topic = topic
+                        st.rerun()
                 with col2:
-                    if st.button("🗑️", key=f"remove_topic_{topic}", help="Remove this topic and its history"):
+                    if st.button("🙈", key=f"hide_topic_{topic}", help="Hide this topic"):
                         matching = [s for s in history.list_sessions(user["id"]) if s["topic"] == topic]
                         for s in matching:
                             history.delete_session(s["id"], user["id"])
+                        history.hide_topic(user["id"], st.session_state.last_filename, topic)
                         st.session_state.topics.remove(topic)
-                        st.session_state.mistakes_by_user[user["id"]] = [
-                            m for m in st.session_state.mistakes_by_user.get(user["id"], [])
-                            if m["topic"] != topic
-                        ]
+                        _set_mistakes([m for m in _get_mistakes() if m["topic"] != topic])
                         if st.session_state.agent and st.session_state.agent.current_topic == topic:
                             st.session_state.agent = None
                             st.session_state.conversation = []
                             st.session_state.current_session_id = None
+                            st.session_state.session_is_pending = False
                             st.session_state.app_state = "topic_select"
                         st.rerun()
         else:
             st.caption("Upload a document to see topics here.")
 
-    with tab_history:
-        sessions = history.list_sessions(user["id"])
-        if not sessions:
-            st.caption("No past sessions yet.")
-        for s in sessions:
-            col1, col2 = st.columns([5, 1])
-            with col1:
-                label = f"{s['document_name']} · {s['topic']}"
-                if st.button(label, key=f"resume_{s['id']}", use_container_width=True):
-                    _resume_session(s["id"])
-                    st.rerun()
-            with col2:
-                if st.button("🗑️", key=f"delete_{s['id']}"):
-                    history.delete_session(s["id"], user["id"])
-                    if s["topic"] in st.session_state.topics:
-                        st.session_state.topics.remove(s["topic"])
-                    st.session_state.mistakes_by_user[user["id"]] = [
-                        m for m in st.session_state.mistakes_by_user.get(user["id"], [])
-                        if m["topic"] != s["topic"]
-                    ]
-                    if st.session_state.agent and st.session_state.agent.current_topic == s["topic"]:
-                        st.session_state.agent = None
-                        st.session_state.conversation = []
-                        st.session_state.current_session_id = None
-                        st.session_state.app_state = "topic_select"
-                    st.rerun()
-
     with tab_review:
         _render_mistakes()
+
+    with tab_hidden:
+        if not st.session_state.last_filename:
+            st.caption("Upload a document to manage its hidden topics.")
+        else:
+            hidden_list = history.get_hidden_topics_list(user["id"], st.session_state.last_filename)
+            if not hidden_list:
+                st.caption("No hidden topics for this document.")
+            for topic in hidden_list:
+                col1, col2 = st.columns([5, 1])
+                with col1:
+                    st.markdown(topic)
+                with col2:
+                    if st.button("👁️", key=f"unhide_{topic}", help="Unhide this topic"):
+                        history.unhide_topic(user["id"], st.session_state.last_filename, topic)
+                        if topic not in st.session_state.topics:
+                            st.session_state.topics.append(topic)
+                        st.rerun()
+
+    st.markdown("#### 🕘 Sessions")
+    sessions = history.list_sessions(user["id"])
+    if not sessions:
+        st.caption("No sessions yet.")
+    for s in sessions:
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            label = f"{s['document_name']} · {s['topic']}"
+            if st.button(label, key=f"resume_{s['id']}", use_container_width=True):
+                _resume_session(s["id"])
+                st.rerun()
+        with col2:
+            if st.button("🗑️", key=f"delete_{s['id']}"):
+                history.delete_session(s["id"], user["id"])
+                if s["topic"] in st.session_state.topics:
+                    st.session_state.topics.remove(s["topic"])
+                if st.session_state.last_filename == s["document_name"]:
+                    _set_mistakes([m for m in _get_mistakes() if m["topic"] != s["topic"]])
+                if st.session_state.current_session_id == s["id"]:
+                    st.session_state.agent = None
+                    st.session_state.conversation = []
+                    st.session_state.current_session_id = None
+                    st.session_state.session_is_pending = False
+                    st.session_state.app_state = "topic_select"
+                st.rerun()
 
     st.divider()
     st.caption(f"Model: {os.getenv('MODEL', 'not configured')}")
@@ -357,6 +476,9 @@ elif state in ("questioning", "feedback", "mastered"):
             st.session_state.conversation.append(
                 {"role": "user", "content": answer, "type": "answer"}
             )
+            with st.chat_message("user"):
+                st.markdown(answer)
+
             asked_question = st.session_state.agent.current_question
             with st.spinner("Evaluating your answer…"):
                 try:
@@ -372,7 +494,8 @@ elif state in ("questioning", "feedback", "mastered"):
             follow_up = result.get("follow_up")
 
             if score in ("partial", "incorrect"):
-                st.session_state.mistakes_by_user.setdefault(user["id"], []).append(
+                current = _get_mistakes()
+                current.append(
                     {
                         "topic": agent.current_topic,
                         "question": asked_question,
@@ -381,6 +504,7 @@ elif state in ("questioning", "feedback", "mastered"):
                         "score": score,
                     }
                 )
+                _set_mistakes(current)
 
             if agent.topic_complete:
                 st.session_state.conversation.append(
@@ -454,19 +578,13 @@ elif state in ("questioning", "feedback", "mastered"):
             if st.button("Change Topic", use_container_width=True):
                 st.session_state.conversation = []
                 st.session_state.app_state = "topic_select"
-                st.session_state.current_session_id = None
                 st.rerun()
         with col3:
             if st.button("Restart Topic", use_container_width=True):
                 topic = st.session_state.agent.current_topic
                 if topic:
-                    with st.spinner("Restarting…"):
-                        try:
-                            _select_topic(topic)
-                        except Exception as e:
-                            st.error(f"Could not restart: {e}")
-                        else:
-                            st.rerun()
+                    st.session_state.pending_topic = topic
+                    st.rerun()
 
     elif state == "mastered":
         if st.session_state.celebrate:
@@ -477,16 +595,10 @@ elif state in ("questioning", "feedback", "mastered"):
             if st.button("Choose Next Topic →", type="primary", use_container_width=True):
                 st.session_state.conversation = []
                 st.session_state.app_state = "topic_select"
-                st.session_state.current_session_id = None
                 st.rerun()
         with col2:
             if st.button("Restart This Topic", use_container_width=True):
                 topic = st.session_state.agent.current_topic
                 if topic:
-                    with st.spinner("Restarting…"):
-                        try:
-                            _select_topic(topic)
-                        except Exception as e:
-                            st.error(f"Could not restart: {e}")
-                        else:
-                            st.rerun()
+                    st.session_state.pending_topic = topic
+                    st.rerun()

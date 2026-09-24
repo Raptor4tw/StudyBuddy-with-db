@@ -47,20 +47,34 @@ def create_session(user_id: int, document_name: str, document_text: str, topic: 
 def update_session(session_id: int, user_id: int, concepts: dict,
                     conversation: list, mistakes: list,
                     current_concept: str | None, current_question: str | None,
-                    follow_up_count: int) -> None:
-    """Overwrite the mutable fields of an existing session (called after every turn)."""
+                    follow_up_count: int, topic: str | None = None) -> None:
+    """Overwrite the mutable fields of an existing session. If `topic` is given,
+    also update it — used to turn an upload's placeholder row into a real topic
+    session once the user picks one, instead of creating a duplicate row."""
     with closing(get_connection()) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """UPDATE study_sessions
-                   SET concepts_json = %s, conversation_json = %s, mistakes_json = %s,
-                       current_concept = %s, current_question = %s, follow_up_count = %s,
-                       updated_at = NOW()
-                   WHERE id = %s AND user_id = %s""",
-                (json.dumps(concepts), json.dumps(conversation), json.dumps(mistakes),
-                 current_concept, current_question, follow_up_count,
-                 session_id, user_id),
-            )
+            if topic is not None:
+                cur.execute(
+                    """UPDATE study_sessions
+                       SET topic = %s, concepts_json = %s, conversation_json = %s, mistakes_json = %s,
+                           current_concept = %s, current_question = %s, follow_up_count = %s,
+                           updated_at = NOW()
+                       WHERE id = %s AND user_id = %s""",
+                    (topic, json.dumps(concepts), json.dumps(conversation), json.dumps(mistakes),
+                     current_concept, current_question, follow_up_count,
+                     session_id, user_id),
+                )
+            else:
+                cur.execute(
+                    """UPDATE study_sessions
+                       SET concepts_json = %s, conversation_json = %s, mistakes_json = %s,
+                           current_concept = %s, current_question = %s, follow_up_count = %s,
+                           updated_at = NOW()
+                       WHERE id = %s AND user_id = %s""",
+                    (json.dumps(concepts), json.dumps(conversation), json.dumps(mistakes),
+                     current_concept, current_question, follow_up_count,
+                     session_id, user_id),
+                )
         conn.commit()
 
 
@@ -114,3 +128,50 @@ def delete_session(session_id: int, user_id: int) -> None:
                 (session_id, user_id),
             )
         conn.commit()
+
+def hide_topic(user_id: int, document_name: str, topic: str) -> None:
+    """Remember that this topic was deleted, so extract_topics() results can be
+    filtered on future loads of the same document — without this, the topic
+    would just reappear since it's regenerated fresh from the document text."""
+    with closing(get_connection()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO hidden_topics (user_id, document_name, topic)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (user_id, document_name, topic) DO NOTHING""",
+                (user_id, document_name, topic),
+            )
+        conn.commit()
+
+
+def get_hidden_topics(user_id: int, document_name: str) -> set:
+    with closing(get_connection()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT topic FROM hidden_topics WHERE user_id = %s AND document_name = %s",
+                (user_id, document_name),
+            )
+            rows = cur.fetchall()
+    return {r["topic"] for r in rows}
+
+def unhide_topic(user_id: int, document_name: str, topic: str) -> None:
+    with closing(get_connection()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM hidden_topics WHERE user_id = %s AND document_name = %s AND topic = %s",
+                (user_id, document_name, topic),
+            )
+        conn.commit()
+
+
+def get_hidden_topics_list(user_id: int, document_name: str) -> list[str]:
+    """Same data as get_hidden_topics() but as an ordered list, for rendering a
+    'Hidden topics' section where the person can unhide individual entries."""
+    with closing(get_connection()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT topic FROM hidden_topics WHERE user_id = %s AND document_name = %s ORDER BY created_at DESC",
+                (user_id, document_name),
+            )
+            rows = cur.fetchall()
+    return [r["topic"] for r in rows]

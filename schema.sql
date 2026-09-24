@@ -35,4 +35,15 @@ CREATE TABLE IF NOT EXISTS study_sessions (
     updated_at        TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS hidden_topics (
+    id             SERIAL PRIMARY KEY,
+    user_id        INTEGER NOT NULL REFERENCES users(id),
+    document_name  TEXT NOT NULL,
+    topic          TEXT NOT NULL,
+    created_at     TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, document_name, topic)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hidden_topics_user_doc ON hidden_topics(user_id, document_name);
+
 CREATE INDEX IF NOT EXISTS idx_study_sessions_user ON study_sessions(user_id);

@@ -3,14 +3,14 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 
+load_dotenv()
+
 from agent.study_agent import StudyBuddyAgent
 from tools.document_loader import load_document
 from tools.rag import RAGIndex
 from auth import init_db
 from auth_ui import require_login, logout
 import history
-
-load_dotenv()
 
 try:
     for _key, _value in st.secrets.items():
@@ -112,6 +112,7 @@ def _select_topic(topic: str):
         st.session_state.last_filename,
         st.session_state.document_text,
         topic,
+        st.session_state.topics,
         agent.concepts,
         st.session_state.conversation,
         st.session_state.mistakes_by_user.get(user["id"], []),
@@ -140,9 +141,18 @@ def _resume_session(session_id: int):
     ]
 
     st.session_state.agent = agent
-    st.session_state.topics = [saved["topic"]]
+    st.session_state.topics = saved["topics"]
     st.session_state.conversation = saved["conversation"]
-    st.session_state.mistakes_by_user[user["id"]] = saved["mistakes"]
+
+    # Merge this session's mistakes into the user's current review list instead of
+    # replacing it outright — dedupe by (topic, question) so re-resuming doesn't duplicate.
+    existing = st.session_state.mistakes_by_user.get(user["id"], [])
+    existing_keys = {(m["topic"], m["question"]) for m in existing}
+    merged = existing + [
+        m for m in saved["mistakes"] if (m["topic"], m["question"]) not in existing_keys
+    ]
+    st.session_state.mistakes_by_user[user["id"]] = merged
+
     st.session_state.document_text = saved["document_text"]
     st.session_state.last_filename = saved["document_name"]
     st.session_state.current_session_id = session_id
@@ -197,11 +207,18 @@ def _render_mistakes():
             answer = m["answer"]
             if len(answer) > 200:
                 answer = answer[:200].rstrip() + "…"
-            st.markdown(f"**{i}. {m['question']}**")
-            st.caption(f"{m['topic']} · {m['score']}")
-            st.markdown(f"Your answer: {answer}")
-            if m["missing"]:
-                st.markdown(f"Missing: {m['missing']}")
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                st.markdown(f"**{i}. {m['question']}**")
+                st.caption(f"{m['topic']} · {m['score']}")
+                st.markdown(f"Your answer: {answer}")
+                if m["missing"]:
+                    st.markdown(f"Missing: {m['missing']}")
+            with col2:
+                if st.button("🗑️", key=f"delete_mistake_{i}"):
+                    st.session_state.mistakes_by_user[user["id"]].pop(i - 1)
+                    _persist()
+                    st.rerun()
             if i < len(mistakes):
                 st.divider()
         if st.button("Clear review list", key="clear_mistakes", use_container_width=True):
@@ -247,14 +264,31 @@ with st.sidebar:
     with tab_topics:
         if st.session_state.topics:
             for topic in st.session_state.topics:
-                if st.button(topic, key=f"btn_{topic}", use_container_width=True):
-                    with st.spinner("Preparing first question…"):
+                col1, col2 = st.columns([5, 1])
+                with col1:
+                    if st.button(topic, key=f"btn_{topic}", use_container_width=True):
                         try:
                             _select_topic(topic)
                         except Exception as e:
                             st.error(f"Could not start topic: {e}")
                         else:
                             st.rerun()
+                with col2:
+                    if st.button("🗑️", key=f"remove_topic_{topic}", help="Remove this topic and its history"):
+                        matching = [s for s in history.list_sessions(user["id"]) if s["topic"] == topic]
+                        for s in matching:
+                            history.delete_session(s["id"], user["id"])
+                        st.session_state.topics.remove(topic)
+                        st.session_state.mistakes_by_user[user["id"]] = [
+                            m for m in st.session_state.mistakes_by_user.get(user["id"], [])
+                            if m["topic"] != topic
+                        ]
+                        if st.session_state.agent and st.session_state.agent.current_topic == topic:
+                            st.session_state.agent = None
+                            st.session_state.conversation = []
+                            st.session_state.current_session_id = None
+                            st.session_state.app_state = "topic_select"
+                        st.rerun()
         else:
             st.caption("Upload a document to see topics here.")
 
@@ -272,6 +306,17 @@ with st.sidebar:
             with col2:
                 if st.button("🗑️", key=f"delete_{s['id']}"):
                     history.delete_session(s["id"], user["id"])
+                    if s["topic"] in st.session_state.topics:
+                        st.session_state.topics.remove(s["topic"])
+                    st.session_state.mistakes_by_user[user["id"]] = [
+                        m for m in st.session_state.mistakes_by_user.get(user["id"], [])
+                        if m["topic"] != s["topic"]
+                    ]
+                    if st.session_state.agent and st.session_state.agent.current_topic == s["topic"]:
+                        st.session_state.agent = None
+                        st.session_state.conversation = []
+                        st.session_state.current_session_id = None
+                        st.session_state.app_state = "topic_select"
                     st.rerun()
 
     with tab_review:

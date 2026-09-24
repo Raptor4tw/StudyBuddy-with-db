@@ -13,4 +13,4 @@ python-docx>=1.1.0
 numpy>=1.26.0
 pytest>=8.0.0
 bcrypt>=4.1.0
-extra-streamlit-components>=0.1.60
+psycopg2-binary>=2.9.9

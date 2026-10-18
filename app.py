@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from agent.models import load_model_options
 from agent.study_agent import StudyBuddyAgent
 from tools.document_loader import load_document
 from tools.rag import RAGIndex
@@ -17,6 +18,9 @@ try:
         os.environ.setdefault(_key, str(_value))
 except Exception:
     pass
+
+MODEL_OPTIONS = load_model_options()
+CONTEXT_WARN_SHARE = float(os.getenv("CONTEXT_WARN_SHARE", "0.4"))
 
 st.set_page_config(page_title="StudyBuddy", page_icon="📚", layout="wide")
 
@@ -119,6 +123,14 @@ for _k, _v in {
     "_rag_cache": {},
     "_docs_cache": None,
     "_doc_meta_cache": {},
+    "model": (
+        _preferred if (_preferred := history.get_preferred_model(user["id"])) in MODEL_OPTIONS
+        else os.getenv("MODEL")
+    ),
+    # How many entries of agent.usage are already written to llm_usage
+    "usage_saved": 0,
+    # The last evaluated (question, answer) pair, kept so another model can re-judge it
+    "last_eval": None,
 }.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -200,6 +212,23 @@ def _set_mistakes(mistakes: list, doc: str | None = None) -> None:
     if not doc:
         return
     st.session_state.mistakes_by_user.setdefault(user["id"], {})[doc] = mistakes
+
+
+def _save_usage():
+    """Write LLM calls made since the last save to llm_usage."""
+    agent = st.session_state.agent
+    if not agent:
+        return
+    history.record_usage(
+        user["id"],
+        st.session_state.current_session_id,
+        agent.usage[st.session_state.usage_saved:],
+    )
+    st.session_state.usage_saved = len(agent.usage)
+
+
+def _save_preferred_model():
+    history.set_preferred_model(user["id"], st.session_state.model)
 
 
 def _persist():
@@ -295,6 +324,7 @@ def _dlg_logout():
             st.session_state["_pending_dialog"] = None
             logout()
 
+    _save_usage()
 
 @st.dialog("Delete document?")
 def _dlg_delete_document(name: str):
@@ -473,6 +503,14 @@ def _handle_upload(uploaded_file) -> None:
     st.session_state.active_document = doc_name
     st.session_state.last_filename = doc_name
     st.session_state.document_text = text
+    rag = RAGIndex(text)
+    agent = StudyBuddyAgent(text, rag)
+    agent.model = st.session_state.model or agent.model
+    topics = agent.extract_topics()
+    st.session_state.agent = agent
+    st.session_state.usage_saved = 0
+    st.session_state.current_session_id = None
+    _save_usage()  # topic extraction belongs to no study session yet
     st.session_state.topics = topics
     st.session_state.agent = None
     st.session_state.conversation = []
@@ -491,6 +529,10 @@ def _select_topic(topic: str) -> None:
 
     meta = _get_doc_meta(doc)
     existing = _find_session_in_meta(meta, topic)
+    st.session_state.last_eval = None
+    st.session_state.app_state = "topic_select"
+    st.session_state.last_filename = uploaded_file.name
+    return len(text), topics
 
     if existing:
         rag = _get_rag(doc, meta["document_text"])
@@ -531,10 +573,11 @@ def _select_topic(topic: str) -> None:
             ),
             "type": "intro",
         },
-        {"role": "assistant", "content": question, "type": "question"},
+        {"role": "assistant", "content": question, "type": "question", "model": agent.model},
     ]
     st.session_state.agent = agent
     st.session_state.active_topic = topic
+    st.session_state.last_eval = None
     st.session_state.app_state = "questioning"
 
     placeholder = _find_placeholder_in_meta(meta)
@@ -554,12 +597,40 @@ def _select_topic(topic: str) -> None:
             _get_mistakes(), agent.current_concept, agent.current_question,
             agent.follow_up_count,
         )
+    _save_usage()
 
     _invalidate_docs_cache()
     _invalidate_doc_meta(doc)
 
+    rag = RAGIndex(saved["document_text"])
+    agent = StudyBuddyAgent(saved["document_text"], rag)
+    agent.model = st.session_state.model or agent.model
+    agent.concepts = saved["concepts"]
+    agent.current_topic = saved["topic"]
+    agent.current_concept = saved["current_concept"]
+    agent.current_question = saved["current_question"]
+    agent.follow_up_count = saved["follow_up_count"]
+    agent.asked_questions = [
+        m["content"] for m in saved["conversation"] if m["type"] == "question"
+    ]
 
 # ── Renderers ─────────────────────────────────────────────────────────────────
+    st.session_state.agent = agent
+    st.session_state.usage_saved = 0
+    st.session_state.topics = [saved["topic"]]
+    st.session_state.conversation = saved["conversation"]
+    st.session_state.mistakes_by_user[user["id"]] = saved["mistakes"]
+    st.session_state.document_text = saved["document_text"]
+    st.session_state.last_filename = saved["document_name"]
+    st.session_state.current_session_id = session_id
+    st.session_state.last_eval = None
+
+    if agent.topic_complete:
+        st.session_state.app_state = "mastered"
+    else:
+        last_type = saved["conversation"][-1]["type"] if saved["conversation"] else None
+        st.session_state.app_state = "questioning" if last_type == "question" else "feedback"
+
 
 def _render_progress():
     agent = st.session_state.agent
@@ -570,6 +641,15 @@ def _render_progress():
     with st.expander("Concept checklist"):
         for concept, covered in agent.concepts.items():
             st.markdown(f"{'✅' if covered else '⬜'} {concept}")
+
+
+def _render_feedback(content: str, score: str):
+    if score == "correct":
+        st.success(content)
+    elif score == "partial":
+        st.warning(content)
+    else:
+        st.error(content)
 
 
 def _render_conversation():
@@ -583,15 +663,126 @@ def _render_conversation():
             elif t == "mastered":
                 st.success(msg["content"])
             elif t == "feedback":
+                _render_feedback(msg["content"], msg.get("score", "partial"))
+            elif t == "second_opinion":
                 score = msg.get("score", "partial")
-                if score == "correct":
-                    st.success(msg["content"])
-                elif score == "partial":
-                    st.warning(msg["content"])
-                else:
-                    st.error(msg["content"])
+                _render_feedback(f"**Second opinion: {score}** — {msg['content']}", score)
             else:
                 st.markdown(msg["content"])
+            # Sessions saved before model selection existed have no "model" key
+            if msg.get("model"):
+                st.caption(f"🤖 {msg['model']}")
+
+
+def _context_share(model: str, prompt_tokens: int) -> float | None:
+    """Share of the model's input limit that one request used, if the limit is known."""
+    limit = MODEL_OPTIONS.get(model)
+    return prompt_tokens / limit if limit else None
+
+
+def _render_usage():
+    agent: StudyBuddyAgent = st.session_state.agent
+    session_id = st.session_state.current_session_id
+    if session_id:
+        # Read from the DB so the totals include earlier visits to this session
+        per_model = history.usage_by_model(user["id"], session_id)
+    else:
+        per_model = {}
+        for u in agent.usage if agent else []:
+            tin, tout, peak = per_model.get(u["model"], (0, 0, 0))
+            per_model[u["model"]] = (
+                tin + u["prompt_tokens"],
+                tout + u["completion_tokens"],
+                max(peak, u["prompt_tokens"]),
+            )
+    if not per_model:
+        st.caption("No tokens used yet.")
+        return
+    st.caption("This study session" if session_id else "This document")
+    col_in, col_out = st.columns(2)
+    col_in.metric("Input", f"{sum(t[0] for t in per_model.values()):,}")
+    col_out.metric("Output", f"{sum(t[1] for t in per_model.values()):,}")
+    if len(per_model) > 1:
+        for name, (tin, tout, _) in per_model.items():
+            st.caption(f"🤖 {name}: {tin:,} in · {tout:,} out")
+
+    # Every call is sent without chat history, so what a model has to read is
+    # one request, not the session total. The largest request is the one at risk.
+    shares = {
+        name: share
+        for name, (_, _, peak) in per_model.items()
+        if (share := _context_share(name, peak)) is not None
+    }
+    if agent and agent.usage:
+        last = agent.usage[-1]
+        share = _context_share(last["model"], last["prompt_tokens"])
+        if share is not None:
+            st.progress(min(share, 1.0), text=f"Last request: {last['prompt_tokens']:,} tokens · {share:.2%} of the input limit")
+        else:
+            st.caption(f"Last request: {last['prompt_tokens']:,} input tokens (input limit not configured)")
+    if shares:
+        peak_model = max(shares, key=shares.get)
+        peak_share = shares[peak_model]
+        st.caption(f"Largest request: {peak_share:.2%} of the input limit ({peak_model})")
+        if peak_share > CONTEXT_WARN_SHARE:
+            st.warning(
+                f"A request used more than {CONTEXT_WARN_SHARE:.0%} of the input limit. "
+                "Models read long inputs less reliably, so questions and feedback may be less accurate."
+            )
+
+
+def _other_models() -> list[str]:
+    current = st.session_state.agent.model
+    return [m for m in MODEL_OPTIONS if m != current]
+
+
+def _render_model_actions():
+    """Let the student ask another model for a fresh question or a second opinion."""
+    agent: StudyBuddyAgent = st.session_state.agent
+    others = _other_models()
+    if not others:
+        return
+    last_eval = st.session_state.last_eval
+    col1, col2 = st.columns(2)
+    if st.session_state.app_state == "questioning":
+        with col1:
+            with st.popover("🔄 New question from another model", use_container_width=True):
+                model = st.selectbox("Model", others, key="regen_model")
+                if st.button("Generate question", key="regen_go", type="primary"):
+                    with st.spinner(f"Asking {model}…"):
+                        try:
+                            q = agent.regenerate_question(model)
+                        except Exception as e:
+                            st.error(f"The AI service did not respond ({e}). Please try again.")
+                            st.stop()
+                    st.session_state.conversation.append(
+                        {"role": "assistant", "content": q, "type": "question", "model": model}
+                    )
+                    _persist()
+                    st.rerun()
+    if last_eval:
+        with col2:
+            with st.popover("🔍 Second opinion on my last answer", use_container_width=True):
+                st.caption("Another model re-checks your last answer. Your progress stays unchanged.")
+                model = st.selectbox("Model", others, key="opinion_model")
+                if st.button("Get second opinion", key="opinion_go", type="primary"):
+                    with st.spinner(f"Asking {model}…"):
+                        try:
+                            result = agent.second_opinion(last_eval["question"], last_eval["answer"], model)
+                        except Exception as e:
+                            st.error(f"The AI service did not respond ({e}). Please try again.")
+                            st.stop()
+                    st.session_state.conversation.append(
+                        {
+                            "role": "assistant",
+                            "content": result.get("feedback", ""),
+                            "type": "second_opinion",
+                            "score": result.get("score", "partial"),
+                            "model": model,
+                        }
+                    )
+                    _persist()
+                    st.rerun()
 
 
 def _render_topics_tab():
@@ -644,7 +835,7 @@ def _render_review_tab():
         col1, col2 = st.columns([5, 1])
         with col1:
             st.markdown(f"**{i}. {m['question']}**")
-            st.caption(f"{m['topic']} · {m['score']}")
+            st.caption(" · ".join(filter(None, [m["topic"], m["score"], m.get("model")])))
             st.markdown(f"Your answer: {answer}")
             if m.get("missing"):
                 st.markdown(f"Missing: {m['missing']}")
@@ -725,6 +916,17 @@ with st.sidebar:
 
     st.divider()
 
+    if MODEL_OPTIONS:
+        st.selectbox(
+            "🤖 Model",
+            list(MODEL_OPTIONS),
+            key="model",
+            on_change=_save_preferred_model,
+            help="Pick the model you trust. You can switch at any time; your progress is kept.",
+        )
+    if st.session_state.agent and st.session_state.model:
+        st.session_state.agent.model = st.session_state.model
+
     uploaded = st.file_uploader(
         "Upload lecture material",
         type=["pdf", "txt", "docx"],
@@ -770,6 +972,8 @@ with st.sidebar:
     st.divider()
     render_stay_signed_in_help()
     st.caption(f"Model: {os.getenv('MODEL', 'not configured')}")
+    with st.expander("📊 Token usage"):
+        _render_usage()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -818,6 +1022,8 @@ elif state in ("questioning", "feedback", "mastered"):
 
     _render_progress()
     _render_conversation()
+    if state in ("questioning", "feedback"):
+        _render_model_actions()
 
     if state == "questioning":
         answer = st.chat_input("Explain your understanding…")
@@ -838,6 +1044,7 @@ elif state in ("questioning", "feedback", "mastered"):
                     st.stop()
 
             agent = st.session_state.agent
+            st.session_state.last_eval = {"question": asked_question, "answer": answer}
             score = result.get("score", "partial")
             feedback = result.get("feedback", "")
             follow_up = result.get("follow_up")
@@ -850,7 +1057,8 @@ elif state in ("questioning", "feedback", "mastered"):
                     "answer": answer,
                     "missing": result.get("missing"),
                     "score": score,
-                })
+                "model": agent.model,
+                    })
                 _set_mistakes(current)
 
             if agent.topic_complete:
@@ -858,7 +1066,8 @@ elif state in ("questioning", "feedback", "mastered"):
                     "role": "assistant",
                     "content": f"Correct! {feedback}" if score == "correct" else feedback,
                     "type": "feedback", "score": score,
-                })
+                "model": agent.model,
+                    })
                 st.session_state.conversation.append({
                     "role": "assistant",
                     "content": f"🎉 You've explained all key concepts of **{agent.current_topic}** — topic mastered!",
@@ -871,21 +1080,21 @@ elif state in ("questioning", "feedback", "mastered"):
                     "role": "assistant",
                     "content": f"Correct! {feedback}",
                     "type": "feedback", "score": "correct",
-                })
+                "model": agent.model,})
                 st.session_state.app_state = "feedback"
             elif follow_up:
                 st.session_state.conversation.append({
-                    "role": "assistant", "content": feedback, "type": "feedback", "score": score,
+                    "role": "assistant", "content": feedback, "type": "feedback", "score": score, "model": agent.model
                 })
                 st.session_state.conversation.append({
-                    "role": "assistant", "content": follow_up, "type": "question",
+                    "role": "assistant", "content": follow_up, "type": "question", "model": agent.model
                 })
             else:
                 st.session_state.conversation.append({
                     "role": "assistant",
                     "content": f"{feedback} Let's approach this from another angle.",
                     "type": "feedback", "score": score,
-                })
+                "model": agent.model,})
                 st.session_state.app_state = "feedback"
 
             _persist()
@@ -901,9 +1110,9 @@ elif state in ("questioning", "feedback", "mastered"):
                     except Exception as e:
                         st.error(f"The AI service did not respond ({e}). Please try again.")
                         st.stop()
-                st.session_state.conversation.append({
-                    "role": "assistant", "content": q, "type": "question",
-                })
+                st.session_state.conversation.append(
+                    {"role": "assistant", "content": q, "type": "question", "model": st.session_state.agent.model}
+                )
                 st.session_state.app_state = "questioning"
                 _persist()
                 st.rerun()

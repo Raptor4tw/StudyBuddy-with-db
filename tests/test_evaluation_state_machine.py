@@ -201,3 +201,40 @@ def test_empty_response_falls_back_gracefully():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+# ── Model choice & usage ─────────────────────────────────────────────────────
+
+def test_second_opinion_does_not_change_progress():
+    agent = make_agent()
+    mock_llm_response(agent, {"score": "correct", "feedback": "Good.",
+                              "follow_up": None, "missing": None,
+                              "covered_concepts": ["3NF definition"]})
+    before = (dict(agent.concepts), agent.current_question, agent.follow_up_count)
+    result = agent.second_opinion("What is 3NF?", "No transitive deps.", "Other-Model")
+    assert result["score"] == "correct"
+    assert (agent.concepts, agent.current_question, agent.follow_up_count) == before
+    assert agent._complete.call_args.args[1] == "Other-Model"
+
+
+def test_regenerate_question_uses_given_model_and_keeps_history():
+    agent = make_agent()
+    agent.asked_questions = ["What is 3NF?"]
+    agent.follow_up_count = 2
+    agent._complete = MagicMock(return_value="Explain transitive dependencies.")
+    q = agent.regenerate_question("Other-Model")
+    assert q == agent.current_question == "Explain transitive dependencies."
+    assert agent.asked_questions == ["What is 3NF?", q]
+    assert agent.follow_up_count == 0
+    assert agent._complete.call_args.args[1] == "Other-Model"
+
+
+def test_usage_recorded_per_call():
+    agent = make_agent()
+    resp = MagicMock()
+    resp.choices[0].message.content = "{}"
+    resp.usage.prompt_tokens = 120
+    resp.usage.completion_tokens = 30
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = resp
+    agent._complete([{"role": "user", "content": "hi"}], "M2")
+    assert agent.usage == [{"model": "M2", "prompt_tokens": 120, "completion_tokens": 30}]

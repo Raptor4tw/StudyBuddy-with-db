@@ -7,6 +7,8 @@ the source document text (so it can be re-indexed without re-uploading),
 the mastery checklist, the full conversation, and the mistakes list.
 """
 
+from __future__ import annotations
+
 import json
 import os
 from contextlib import closing
@@ -279,3 +281,49 @@ def get_hidden_topics_list(user_id: int, document_name: str) -> list[str]:
             )
             rows = cur.fetchall()
     return [r["topic"] for r in rows]
+
+
+def record_usage(user_id: int, session_id: int | None, usage: list[dict]) -> None:
+    """Store LLM calls ({"model", "prompt_tokens", "completion_tokens"}) for a user.
+    session_id is None for calls made before a topic is chosen (topic extraction)."""
+    if not usage:
+        return
+    with closing(get_connection()) as conn:
+        conn.executemany(
+            """INSERT INTO llm_usage (user_id, session_id, model, prompt_tokens, completion_tokens)
+               VALUES (?, ?, ?, ?, ?)""",
+            [(user_id, session_id, u["model"], u["prompt_tokens"], u["completion_tokens"])
+             for u in usage],
+        )
+        conn.commit()
+
+
+def usage_by_model(user_id: int, session_id: int) -> dict[str, tuple[int, int, int]]:
+    """Return {model: (prompt_tokens, completion_tokens, largest single prompt)}
+    for one session. The largest prompt shows how close a request came to the
+    model's input limit, since each call is sent without chat history."""
+    with closing(get_connection()) as conn:
+        rows = conn.execute(
+            """SELECT model, SUM(prompt_tokens) AS p, SUM(completion_tokens) AS c,
+                      MAX(prompt_tokens) AS peak
+               FROM llm_usage WHERE user_id = ? AND session_id = ?
+               GROUP BY model ORDER BY MIN(id)""",
+            (user_id, session_id),
+        ).fetchall()
+    return {r["model"]: (r["p"], r["c"], r["peak"]) for r in rows}
+
+
+def get_preferred_model(user_id: int) -> str | None:
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT preferred_model FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    return row["preferred_model"] if row else None
+
+
+def set_preferred_model(user_id: int, model: str) -> None:
+    with closing(get_connection()) as conn:
+        conn.execute(
+            "UPDATE users SET preferred_model = ? WHERE id = ?", (model, user_id)
+        )
+        conn.commit()

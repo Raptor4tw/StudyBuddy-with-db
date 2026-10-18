@@ -3,6 +3,8 @@ auth.py - User signup, login, and persistent login sessions for StudyBuddy,
 backed by Postgres (Supabase) instead of local SQLite.
 """
 
+from __future__ import annotations
+
 import os
 import re
 import secrets
@@ -30,6 +32,11 @@ def init_db() -> None:
     ) as f:
         with conn.cursor() as cur:
             cur.execute(f.read())
+        # CREATE TABLE IF NOT EXISTS does not add columns to an existing users
+        # table, so databases created before this column existed are migrated here.
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+        if "preferred_model" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN preferred_model TEXT")
         conn.commit()
 
 

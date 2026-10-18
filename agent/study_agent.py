@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import random
@@ -85,8 +87,11 @@ class StudyBuddyAgent:
         self.asked_questions: list[str] = []
         self.follow_up_count: int = 0
         self.max_follow_ups: int = 2
+        # One entry per LLM call: {"model", "prompt_tokens", "completion_tokens"}.
+        # Kept in memory only; the app decides whether to persist it.
+        self.usage: list[dict] = []
 
-    def _complete(self, messages: list) -> str:
+    def _complete(self, messages: list, model: str | None = None) -> str:
         """Call the LLM, retrying when the endpoint is momentarily saturated.
 
         The API limits how many requests may be in flight per key, so a shared
@@ -97,9 +102,10 @@ class StudyBuddyAgent:
         for attempt in range(_MAX_RETRIES):
             try:
                 resp = self.client.chat.completions.create(
-                    model=self.model,
+                    model=model or self.model,
                     messages=messages,
                 )
+                self._record_usage(model or self.model, resp)
                 return resp.choices[0].message.content or ""
             except Exception as e:
                 if attempt == _MAX_RETRIES - 1 or not _is_retryable(e):
@@ -107,6 +113,18 @@ class StudyBuddyAgent:
                 time.sleep(delay + random.uniform(0, 0.4))
                 delay *= 2
         return ""  # unreachable: the loop either returns or raises
+
+    def _record_usage(self, model: str, resp) -> None:
+        usage = getattr(resp, "usage", None)
+        if usage is None:
+            return
+        self.usage.append(
+            {
+                "model": model,
+                "prompt_tokens": usage.prompt_tokens or 0,
+                "completion_tokens": usage.completion_tokens or 0,
+            }
+        )
 
     def extract_topics(self) -> list[str]:
         sample = _sample_text(self.text)
@@ -157,7 +175,7 @@ class StudyBuddyAgent:
         self.concepts = {c: False for c in self._extract_concepts(topic, context)}
         return self._generate_question()
 
-    def _generate_question(self) -> str:
+    def _generate_question(self, model: str | None = None) -> str:
         self.current_concept = self._next_uncovered() or self.current_topic
         context = self.rag.retrieve(f"{self.current_topic} {self.current_concept}", k=4)
         asked = "\n".join(f"- {q}" for q in self.asked_questions) or "(none yet)"
@@ -167,22 +185,21 @@ class StudyBuddyAgent:
             context=context,
             asked=asked,
         )
-        q = _strip_thinking(self._complete([{"role": "user", "content": prompt}]))
+        q = _strip_thinking(self._complete([{"role": "user", "content": prompt}], model))
         self.current_question = q
         self.asked_questions.append(q)
         return q
 
-    def evaluate_answer(self, student_answer: str) -> dict:
-        context = self.rag.retrieve(
-            f"{self.current_question} {student_answer}", k=5
-        )
+    def _evaluate(self, question: str, student_answer: str, model: str | None = None) -> dict:
+        """Judge an answer without touching the learning state."""
+        context = self.rag.retrieve(f"{question} {student_answer}", k=5)
         prompt = EVALUATION_PROMPT.format(
             context=context,
             concepts="\n".join(f"- {c}" for c in self.concepts),
-            question=self.current_question,
+            question=question,
             answer=student_answer,
         )
-        raw = self._complete([{"role": "user", "content": prompt}])
+        raw = self._complete([{"role": "user", "content": prompt}], model)
         parsed = _parse_json(raw)
 
         if not isinstance(parsed, dict):
@@ -193,6 +210,10 @@ class StudyBuddyAgent:
                 "missing": None,
                 "covered_concepts": [],
             }
+        return parsed
+
+    def evaluate_answer(self, student_answer: str) -> dict:
+        parsed = self._evaluate(self.current_question, student_answer)
 
         _mark_covered(self.concepts, parsed.get("covered_concepts") or [])
         if parsed.get("score") == "correct" and self.current_concept in self.concepts:
@@ -209,6 +230,18 @@ class StudyBuddyAgent:
 
         return parsed
 
+    def second_opinion(self, question: str, student_answer: str, model: str) -> dict:
+        """Re-judge an earlier answer with another model. Display only: progress
+        stays as the first evaluation left it, so switching models cannot be
+        used to farm a "correct"."""
+        return self._evaluate(question, student_answer, model)
+
     def next_question(self) -> str:
         self.follow_up_count = 0
         return self._generate_question()
+
+    def regenerate_question(self, model: str) -> str:
+        """Replace the open question with a fresh one from another model. The
+        old question stays in asked_questions so it is not repeated."""
+        self.follow_up_count = 0
+        return self._generate_question(model)

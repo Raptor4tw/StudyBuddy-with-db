@@ -1,6 +1,7 @@
 import os
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 from agent.study_agent import StudyBuddyAgent
@@ -102,6 +103,21 @@ def _render_conversation():
                 st.markdown(msg["content"])
 
 
+def _scroll_to_latest():
+    # A rerun jumps the page back to the top; bring the newest message into view instead.
+    # The message count is part of the HTML so the script runs again for every new message.
+    components.html(
+        f"""<script>
+        // messages: {len(st.session_state.conversation)}
+        setTimeout(() => {{
+            const msgs = window.parent.document.querySelectorAll('[data-testid="stChatMessage"]');
+            if (msgs.length) msgs[msgs.length - 1].scrollIntoView({{behavior: "smooth", block: "start"}});
+        }}, 150);
+        </script>""",
+        height=0,
+    )
+
+
 def _render_mistakes():
     mistakes = st.session_state.mistakes
     if not mistakes:
@@ -189,6 +205,7 @@ elif state == "topic_select":
 elif state in ("questioning", "feedback", "mastered"):
     _render_progress()
     _render_conversation()
+    _scroll_to_latest()
 
     if state == "questioning":
         answer = st.chat_input("Explain your understanding…")

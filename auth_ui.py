@@ -1,20 +1,21 @@
 """
 auth_ui.py - Streamlit signup/login screens for StudyBuddy, with a
-persistent login cookie so sessions survive new tabs and reloads.
+persistent login session carried via a URL query parameter instead of
+a cookie.
 
-Cookie handling:
-    - READ via st.context.cookies (built into Streamlit, no extra package,
-      available immediately at script start from the request headers).
-    - WRITE via a tiny injected <script> that sets the cookie on the PARENT
-      document (since components.html renders inside its own iframe), then
-      triggers a full browser reload itself. The reload is triggered by the
-      script, not by st.rerun(), so the cookie write is guaranteed to finish
-      before anything else happens — doing it the other way around created a
-      race where Streamlit tore the iframe down before the script could run.
+Why a query param instead of a cookie: this Streamlit Cloud environment
+has a server-side bug where any iframe-based content (components.html,
+st.iframe) crashes with an ASGI RuntimeError, which made cookie-writing
+via injected JavaScript unusable. A query param needs no iframe, no
+JavaScript, and no static file serving — it's set and read in pure Python.
+
+Trade-off: the token is visible in the browser's address bar and history.
+This is less secure than an HttpOnly cookie, but survives page reloads
+and "open in new tab" as long as the URL (with its ?t=... parameter) is
+preserved, which Streamlit does automatically across reruns.
 """
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 from auth import (
     LoginError,
@@ -26,39 +27,7 @@ from auth import (
     get_user_by_session,
 )
 
-COOKIE_NAME = "studybuddy_session"
-COOKIE_EXPIRY_DAYS = 30
-
-
-def _set_cookie_and_reload(token: str) -> None:
-    st.iframe(
-        f"""<script>
-        try {{
-            const secure = window.parent.location.protocol === "https:" ? "; Secure" : "";
-            window.parent.document.cookie = "{COOKIE_NAME}={token}; max-age={COOKIE_EXPIRY_DAYS * 86400}; path=/; SameSite=Lax" + secure;
-        }} catch (e) {{
-            console.error("Could not set cookie on parent document:", e);
-        }}
-        window.parent.location.reload();
-        </script>""",
-        height=1,
-        width=1,
-    )
-
-
-def _clear_cookie_and_reload() -> None:
-    st.iframe(
-        f"""<script>
-        try {{
-            window.parent.document.cookie = "{COOKIE_NAME}=; max-age=0; path=/; SameSite=Lax";
-        }} catch (e) {{
-            console.error("Could not clear cookie on parent document:", e);
-        }}
-        window.parent.location.reload();
-        </script>""",
-        height=1,
-        width=1,
-    )
+TOKEN_PARAM = "t"
 
 
 def _login_form() -> None:
@@ -78,9 +47,8 @@ def _login_form() -> None:
 
     token = create_session(user["id"])
     st.session_state["user"] = user
-    st.info("Logging in…")
-    _set_cookie_and_reload(token)
-    st.stop()
+    st.query_params[TOKEN_PARAM] = token
+    st.rerun()
 
 
 def _signup_form() -> None:
@@ -106,29 +74,28 @@ def _signup_form() -> None:
 
     token = create_session(user["id"])
     st.session_state["user"] = user
-    st.success(f"Account created! Welcome, {user['username']}. Logging in…")
-    _set_cookie_and_reload(token)
-    st.stop()
+    st.query_params[TOKEN_PARAM] = token
+    st.rerun()
 
 
 def require_login() -> dict | None:
     """
     Returns the logged-in user dict, checking: session_state (this tab's
-    current connection), then the login cookie (survives new tabs/reloads),
-    then falls back to rendering login/signup tabs.
+    current connection), then the token in the URL query params (survives
+    reloads and new tabs as long as the URL is carried along), then falls
+    back to rendering login/signup tabs.
     """
     if "user" in st.session_state:
         return st.session_state["user"]
 
-    token = st.context.cookies.get(COOKIE_NAME)
+    token = st.query_params.get(TOKEN_PARAM)
     if token:
         user = get_user_by_session(token)
         if user:
             st.session_state["user"] = user
             return user
-        # stale/expired token — clean it up client-side
-        _clear_cookie_and_reload()
-        st.stop()
+        # stale/expired token — drop it from the URL
+        del st.query_params[TOKEN_PARAM]
 
     st.title("StudyBuddy — Sign in")
     login_tab, signup_tab = st.tabs(["Log in", "Sign up"])
@@ -143,10 +110,10 @@ def require_login() -> dict | None:
 
 
 def logout() -> None:
-    """Clears session_state, the DB session row, and the browser cookie, then reloads."""
-    token = st.context.cookies.get(COOKIE_NAME)
+    """Clears session_state, the DB session row, and the URL token."""
+    token = st.query_params.get(TOKEN_PARAM)
     if token:
         delete_session(token)
+        del st.query_params[TOKEN_PARAM]
     st.session_state.pop("user", None)
-    _clear_cookie_and_reload()
-    st.stop()
+    st.rerun()

@@ -54,7 +54,7 @@ CREATE INDEX IF NOT EXISTS idx_study_sessions_user ON study_sessions(user_id);
 CREATE TABLE IF NOT EXISTS llm_usage (
     id                SERIAL PRIMARY KEY,
     user_id           INTEGER NOT NULL REFERENCES users(id),
-    session_id        INTEGER REFERENCES study_sessions(id),
+    session_id        INTEGER REFERENCES study_sessions(id) ON DELETE CASCADE,
     model             TEXT NOT NULL,
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,

@@ -92,6 +92,98 @@ def list_sessions(user_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def list_documents(user_id: int) -> list[dict]:
+    """Return distinct documents for this user (one row per document_name),
+    most recently updated first."""
+    with closing(get_connection()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT document_name, MAX(updated_at) AS last_updated
+                   FROM study_sessions
+                   WHERE user_id = %s
+                   GROUP BY document_name
+                   ORDER BY last_updated DESC""",
+                (user_id,),
+            )
+            rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def load_document_meta(user_id: int, document_name: str) -> dict | None:
+    """Load everything for one document in ONE roundtrip:
+      - document_text (from any session)
+      - topics snapshot (from the most recent session's topics_json)
+      - all sessions with full payloads (so _render_topics_tab and
+        _find_session_for don't need extra DB roundtrips)
+      - aggregated mistakes across all sessions (deduped by (topic, question))
+    """
+    with closing(get_connection()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, document_text, topic, topics_json,
+                          concepts_json, conversation_json, mistakes_json,
+                          current_concept, current_question, follow_up_count,
+                          updated_at
+                   FROM study_sessions
+                   WHERE user_id = %s AND document_name = %s
+                   ORDER BY updated_at DESC""",
+                (user_id, document_name),
+            )
+            rows = cur.fetchall()
+
+    if not rows:
+        return None
+
+    # document_text/topics_json are identical across sessions of the same doc
+    document_text = rows[0]["document_text"]
+    topics_snapshot = json.loads(rows[0]["topics_json"]) if rows[0]["topics_json"] else []
+
+    # Aggregate mistakes across all sessions (deduped)
+    merged_mistakes: list = []
+    seen_keys: set = set()
+
+    sessions = []
+    for r in rows:
+        try:
+            concepts = json.loads(r["concepts_json"]) if r["concepts_json"] else {}
+        except (TypeError, ValueError):
+            concepts = {}
+        try:
+            conversation = json.loads(r["conversation_json"]) if r["conversation_json"] else []
+        except (TypeError, ValueError):
+            conversation = []
+        try:
+            mistakes = json.loads(r["mistakes_json"]) if r["mistakes_json"] else []
+        except (TypeError, ValueError):
+            mistakes = []
+
+        for m in mistakes:
+            key = (m.get("topic"), m.get("question"))
+            if key not in seen_keys:
+                seen_keys.add(key)
+                merged_mistakes.append(m)
+
+        sessions.append({
+            "id": r["id"],
+            "topic": r["topic"],
+            "concepts": concepts,
+            "conversation": conversation,
+            "mistakes": mistakes,
+            "current_concept": r["current_concept"],
+            "current_question": r["current_question"],
+            "follow_up_count": r["follow_up_count"],
+            "updated_at": r["updated_at"],
+        })
+
+    return {
+        "document_name": document_name,
+        "document_text": document_text,
+        "topics": topics_snapshot,
+        "sessions": sessions,
+        "mistakes": merged_mistakes,
+    }
+
+
 def load_session(session_id: int, user_id: int) -> dict | None:
     """Return the full saved state of one session, or None if not found/not owned by this user."""
     with closing(get_connection()) as conn:
@@ -129,10 +221,23 @@ def delete_session(session_id: int, user_id: int) -> None:
             )
         conn.commit()
 
+
+def delete_document(user_id: int, document_name: str) -> None:
+    """Delete all sessions AND hidden_topics entries for one document."""
+    with closing(get_connection()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM study_sessions WHERE user_id = %s AND document_name = %s",
+                (user_id, document_name),
+            )
+            cur.execute(
+                "DELETE FROM hidden_topics WHERE user_id = %s AND document_name = %s",
+                (user_id, document_name),
+            )
+        conn.commit()
+
+
 def hide_topic(user_id: int, document_name: str, topic: str) -> None:
-    """Remember that this topic was deleted, so extract_topics() results can be
-    filtered on future loads of the same document — without this, the topic
-    would just reappear since it's regenerated fresh from the document text."""
     with closing(get_connection()) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -154,6 +259,7 @@ def get_hidden_topics(user_id: int, document_name: str) -> set:
             rows = cur.fetchall()
     return {r["topic"] for r in rows}
 
+
 def unhide_topic(user_id: int, document_name: str, topic: str) -> None:
     with closing(get_connection()) as conn:
         with conn.cursor() as cur:
@@ -165,8 +271,6 @@ def unhide_topic(user_id: int, document_name: str, topic: str) -> None:
 
 
 def get_hidden_topics_list(user_id: int, document_name: str) -> list[str]:
-    """Same data as get_hidden_topics() but as an ordered list, for rendering a
-    'Hidden topics' section where the person can unhide individual entries."""
     with closing(get_connection()) as conn:
         with conn.cursor() as cur:
             cur.execute(

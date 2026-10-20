@@ -71,6 +71,45 @@ def _mark_covered(concepts: dict, names: list) -> None:
             concepts[key] = True
 
 
+def _is_broken_topic(s: str) -> bool:
+    """Reject anything that looks like a JSON key, metadata fragment, or
+    truncated model output — these sometimes slip into topic lists."""
+    if not s:
+        return True
+    low = s.lower()
+    if "is_lecture_material" in low:
+        return True
+    if low in {"topics", "topic", "json", "true", "false", "null"}:
+        return True
+    # Drop JSON-ish leftovers
+    if any(ch in s for ch in "{}[]"):
+        return True
+    # Drop names that start with a quote or colon (broken JSON fragment)
+    if s[0] in "\"':" or s[-1] in "\"':":
+        return True
+    # Length sanity
+    if len(s) < 3 or len(s) > 80:
+        return True
+    return False
+
+
+def _clean_topics(items) -> list[str]:
+    """Normalize and filter any iterable of candidate topic names."""
+    if not items:
+        return []
+    if isinstance(items, dict):
+        # If the model returned {topics: [...]}, unwrap it.
+        items = items.get("topics") or []
+    cleaned: list[str] = []
+    for t in items:
+        s = str(t).strip().strip("\"'`").strip()
+        if _is_broken_topic(s):
+            continue
+        if s not in cleaned:
+            cleaned.append(s)
+    return cleaned
+
+
 class StudyBuddyAgent:
     def __init__(self, text: str, rag: RAGIndex):
         self.text = text
@@ -92,12 +131,7 @@ class StudyBuddyAgent:
         self.usage: list[dict] = []
 
     def _complete(self, messages: list, model: str | None = None) -> str:
-        """Call the LLM, retrying when the endpoint is momentarily saturated.
-
-        The API limits how many requests may be in flight per key, so a shared
-        deployment hits 429 whenever two people answer at the same time. Those
-        are transient, so back off and retry instead of failing the session.
-        """
+        """Call the LLM, retrying when the endpoint is momentarily saturated."""
         delay = _RETRY_BASE_DELAY
         for attempt in range(_MAX_RETRIES):
             try:
@@ -112,7 +146,7 @@ class StudyBuddyAgent:
                     raise
                 time.sleep(delay + random.uniform(0, 0.4))
                 delay *= 2
-        return ""  # unreachable: the loop either returns or raises
+        return ""  # unreachable
 
     def _record_usage(self, model: str, resp) -> None:
         usage = getattr(resp, "usage", None)
@@ -132,15 +166,60 @@ class StudyBuddyAgent:
             [{"role": "user", "content": TOPIC_EXTRACTION_PROMPT.format(text=sample)}]
         )
         parsed = _parse_json(raw)
+
+        # New response shape: {is_lecture_material, topics}
+        if isinstance(parsed, dict) and "is_lecture_material" in parsed:
+            if not parsed["is_lecture_material"]:
+                raise ValueError(
+                    "Dieses Dokument scheint kein Lernmaterial zu sein. "
+                    "StudyBuddy ist für Vorlesungen, Skripte und Übungen "
+                    "gedacht — bitte lade ein entsprechendes Dokument hoch."
+                )
+            topics = _clean_topics(parsed.get("topics") or [])
+            return topics[:8] if topics else ["Main Content"]
+
+        # If we got a list, clean it.
         if isinstance(parsed, list):
-            return [str(t) for t in parsed if t][:8]
-        # Fallback: pull non-empty lines that look like topic names
-        lines = [
-            l.strip().strip('",-[]').strip()
-            for l in _strip_thinking(raw).splitlines()
-            if l.strip()
-        ]
-        return [l for l in lines if 3 < len(l) < 80][:8] or ["Main Content"]
+            topics = _clean_topics(parsed)
+            if topics:
+                return topics[:8]
+
+        # Parsing failed. Retry once with a stricter prompt.
+        retry_prompt = (
+            TOPIC_EXTRACTION_PROMPT.format(text=sample)
+            + "\n\nIMPORTANT: Respond with valid JSON only, no markdown, no explanation, "
+              "no line breaks inside strings. The JSON must be parseable by json.loads()."
+        )
+        raw2 = self._complete([{"role": "user", "content": retry_prompt}])
+        parsed2 = _parse_json(raw2)
+        if isinstance(parsed2, dict) and "is_lecture_material" in parsed2:
+            if not parsed2["is_lecture_material"]:
+                raise ValueError(
+                    "Dieses Dokument scheint kein Lernmaterial zu sein. "
+                    "StudyBuddy ist für Vorlesungen, Skripte und Übungen "
+                    "gedacht — bitte lade ein entsprechendes Dokument hoch."
+                )
+            topics = _clean_topics(parsed2.get("topics") or [])
+            if topics:
+                return topics[:8]
+        if isinstance(parsed2, list):
+            topics = _clean_topics(parsed2)
+            if topics:
+                return topics[:8]
+
+        # Last resort: line-based extraction, then clean.
+        for candidate in (raw2, raw):
+            lines = [
+                l.strip().strip('",-[]{}:').strip()
+                for l in _strip_thinking(candidate).splitlines()
+                if l.strip()
+            ]
+            topics = _clean_topics(lines)
+            if topics:
+                return topics[:8]
+
+        # Nothing usable at all — do not block, just use a placeholder.
+        return ["Main Content"]
 
     def _extract_concepts(self, topic: str, context: str) -> list[str]:
         raw = self._complete(
@@ -219,7 +298,6 @@ class StudyBuddyAgent:
         if parsed.get("score") == "correct" and self.current_concept in self.concepts:
             self.concepts[self.current_concept] = True
 
-        # No follow-up needed once the topic is complete; enforce the limit otherwise
         if self.topic_complete or self.follow_up_count >= self.max_follow_ups:
             parsed["follow_up"] = None
 
@@ -231,9 +309,7 @@ class StudyBuddyAgent:
         return parsed
 
     def second_opinion(self, question: str, student_answer: str, model: str) -> dict:
-        """Re-judge an earlier answer with another model. Display only: progress
-        stays as the first evaluation left it, so switching models cannot be
-        used to farm a "correct"."""
+        """Re-judge an earlier answer with another model. Display only."""
         return self._evaluate(question, student_answer, model)
 
     def next_question(self) -> str:
@@ -241,7 +317,6 @@ class StudyBuddyAgent:
         return self._generate_question()
 
     def regenerate_question(self, model: str) -> str:
-        """Replace the open question with a fresh one from another model. The
-        old question stays in asked_questions so it is not repeated."""
+        """Replace the open question with a fresh one from another model."""
         self.follow_up_count = 0
         return self._generate_question(model)

@@ -8,6 +8,7 @@ load_dotenv()
 from agent.models import load_model_options
 from agent.study_agent import StudyBuddyAgent
 from tools.document_loader import load_document
+from tools.document_validator import check_is_learning_material
 from tools.rag import RAGIndex
 from auth import init_db
 from auth_ui import require_login, logout, render_stay_signed_in_help
@@ -285,7 +286,10 @@ def _open_document(document_name: str) -> None:
 
     hidden = history.get_hidden_topics(user["id"], document_name)
     topics_snapshot = meta["topics"] or []
-    st.session_state.topics = [t for t in topics_snapshot if t not in hidden]
+    st.session_state.topics = [
+        t for t in topics_snapshot
+        if t not in hidden and t and "is_lecture_material" not in t.lower()
+    ]
 
     if not _get_mistakes(document_name):
         _set_mistakes(list(meta["mistakes"]), document_name)
@@ -492,6 +496,11 @@ def _handle_upload(uploaded_file) -> None:
     if len(text.strip()) < 50:
         raise ValueError("Document appears empty or could not be parsed.")
 
+    # ── Fast heuristic check before any LLM / RAG work ────────────────────
+    is_material, reason = check_is_learning_material(text)
+    if not is_material:
+        raise ValueError(reason)
+
     doc_name = uploaded_file.name
 
     existing_meta = history.load_document_meta(user["id"], doc_name)
@@ -499,17 +508,31 @@ def _handle_upload(uploaded_file) -> None:
         topics = existing_meta["topics"]
         _get_rag(doc_name, text)  # pre-warm the cache
     else:
+        # LLM-guard also runs inside extract_topics() and can raise ValueError
+        # for borderline documents that slipped past the heuristic.
         rag = _get_rag(doc_name, text)
         agent = StudyBuddyAgent(text, rag)
         if st.session_state.model:
             agent.model = st.session_state.model
-        topics = agent.extract_topics()
+        try:
+            topics = agent.extract_topics()
+        except ValueError as e:
+            # The document is not lecture material — clean up the half-built
+            # RAG cache so a retry with a correct file does not reuse it.
+            _invalidate_rag(doc_name)
+            raise ValueError(str(e)) from e
+
         st.session_state.agent = agent
         st.session_state.usage_saved = 0
         _save_usage()  # topic extraction belongs to no study session yet
 
     hidden = history.get_hidden_topics(user["id"], doc_name)
-    topics = [t for t in topics if t not in hidden]
+    topics = [
+        t for t in topics
+        if t not in hidden and t and "is_lecture_material" not in t.lower()
+    ]
+    if not topics:
+        topics = ["Main Content"]
 
     if not existing_meta:
         history.create_session(
@@ -789,6 +812,8 @@ def _render_topics_tab():
         sessions_by_topic.setdefault(s["topic"], s)
 
     for topic in st.session_state.topics:
+        if not topic or "is_lecture_material" in topic.lower():
+            continue
         with st.container(horizontal=True, horizontal_alignment="distribute",
                           vertical_alignment="center"):
             s = sessions_by_topic.get(topic)
@@ -925,8 +950,37 @@ with st.sidebar:
                     st.session_state._uploader_key += 1
                     st.session_state._uploader_had_file = False
                     st.rerun()
+                except ValueError as e:
+                    msg = str(e)
+                    # Known rejections are shown as a friendly warning.
+                    if any(k in msg for k in (
+                            "Lernmaterial", "Rechnung", "Abrechnung",
+                            "zu kurz", "not lecture", "Document appears empty",
+                    )):
+                        st.warning(msg)
+                    else:
+                        print(f"[upload ValueError] {msg}")
+                        st.error(
+                            "Das Dokument konnte nicht verarbeitet werden. "
+                            "Bitte lade eine andere Datei hoch."
+                        )
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    # Any other exception: log the traceback for debugging but
+                    # never leak the raw model output into the UI.
+                    import traceback
+
+                    traceback.print_exc()
+                    st.error(
+                        "Das Dokument konnte nicht verarbeitet werden. "
+                        "Bitte lade eine andere Datei hoch."
+                    )
+                except Exception as e:
+                    print(f"[upload error] {type(e).__name__}: {e}")  # server log
+                    st.error(
+                        "Das Dokument konnte nicht verarbeitet werden. "
+                        "Bitte lade eine andere Datei hoch oder versuche "
+                        "es später erneut."
+                    )
     elif st.session_state._uploader_had_file:
         st.session_state._uploader_had_file = False
 

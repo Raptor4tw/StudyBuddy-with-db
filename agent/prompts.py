@@ -1,14 +1,29 @@
 TOPIC_EXTRACTION_PROMPT = """\
-Read the following excerpt from lecture material and identify the main topics or concepts covered.
+Read the following excerpt and decide whether it is lecture material —
+a script, slides, exercises, or notes from a course. It is NOT lecture
+material if it is a payslip, invoice, bank statement, contract, receipt,
+letter, or any other personal or administrative document.
 
-Return ONLY a JSON array of short topic names (3-8 items). Example:
-["Supervised Learning", "Neural Networks", "Gradient Descent"]
+If it IS lecture material, identify the main topics or concepts covered.
 
-Write the topic names in the same language as the material.
+Return ONLY a JSON object, exactly like this (no markdown, no code fence,
+no explanation before or after):
 
-No explanation — JSON array only.
+{{"is_lecture_material": true, "topics": ["Supervised Learning", "Neural Networks", "Gradient Descent"]}}
 
-Material:
+If it is NOT lecture material, return exactly:
+
+{{"is_lecture_material": false, "topics": []}}
+
+Rules:
+- "topics" must be 3-8 short topic names written in the same language as the text.
+- For payslips and invoices, is_lecture_material is ALWAYS false, even if
+  the document contains numeric or financial content that could be mistaken
+  for a "topic".
+- No markdown, no backticks, no surrounding prose — JSON object only.
+- Strings must not contain line breaks.
+
+Text:
 {text}
 """
 

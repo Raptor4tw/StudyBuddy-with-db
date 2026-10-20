@@ -111,14 +111,27 @@ def list_documents(user_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _is_broken_topic_name(s: str) -> bool:
+    """Same filter as study_agent._is_broken_topic — kept here too so old
+    rows in the DB never leak broken fragments into the UI."""
+    if not s:
+        return True
+    low = s.lower()
+    if "is_lecture_material" in low:
+        return True
+    if low in {"topics", "topic", "json", "true", "false", "null"}:
+        return True
+    if any(ch in s for ch in "{}[]"):
+        return True
+    if s[0] in "\"':" or s[-1] in "\"':":
+        return True
+    if len(s) < 3 or len(s) > 80:
+        return True
+    return False
+
+
 def load_document_meta(user_id: int, document_name: str) -> dict | None:
-    """Load everything for one document in ONE roundtrip:
-      - document_text (from any session)
-      - topics snapshot (from the most recent session's topics_json)
-      - all sessions with full payloads (so _render_topics_tab and
-        _find_session_for don't need extra DB roundtrips)
-      - aggregated mistakes across all sessions (deduped by (topic, question))
-    """
+    """Load everything for one document in ONE roundtrip."""
     with closing(get_connection()) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -136,11 +149,14 @@ def load_document_meta(user_id: int, document_name: str) -> dict | None:
     if not rows:
         return None
 
-    # document_text/topics_json are identical across sessions of the same doc
     document_text = rows[0]["document_text"]
-    topics_snapshot = json.loads(rows[0]["topics_json"]) if rows[0]["topics_json"] else []
+    raw_topics = json.loads(rows[0]["topics_json"]) if rows[0]["topics_json"] else []
+    # Filter broken entries left over from older runs
+    topics_snapshot = [
+        str(t).strip() for t in (raw_topics or [])
+        if isinstance(t, str) and not _is_broken_topic_name(str(t).strip())
+    ]
 
-    # Aggregate mistakes across all sessions (deduped)
     merged_mistakes: list = []
     seen_keys: set = set()
 

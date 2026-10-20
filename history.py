@@ -289,12 +289,15 @@ def record_usage(user_id: int, session_id: int | None, usage: list[dict]) -> Non
     if not usage:
         return
     with closing(get_connection()) as conn:
-        conn.executemany(
-            """INSERT INTO llm_usage (user_id, session_id, model, prompt_tokens, completion_tokens)
-               VALUES (?, ?, ?, ?, ?)""",
-            [(user_id, session_id, u["model"], u["prompt_tokens"], u["completion_tokens"])
-             for u in usage],
-        )
+        with conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO llm_usage
+                   (user_id, session_id, model, prompt_tokens, completion_tokens)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                [(user_id, session_id, u["model"],
+                  u["prompt_tokens"], u["completion_tokens"])
+                 for u in usage],
+            )
         conn.commit()
 
 
@@ -303,27 +306,43 @@ def usage_by_model(user_id: int, session_id: int) -> dict[str, tuple[int, int, i
     for one session. The largest prompt shows how close a request came to the
     model's input limit, since each call is sent without chat history."""
     with closing(get_connection()) as conn:
-        rows = conn.execute(
-            """SELECT model, SUM(prompt_tokens) AS p, SUM(completion_tokens) AS c,
-                      MAX(prompt_tokens) AS peak
-               FROM llm_usage WHERE user_id = ? AND session_id = ?
-               GROUP BY model ORDER BY MIN(id)""",
-            (user_id, session_id),
-        ).fetchall()
-    return {r["model"]: (r["p"], r["c"], r["peak"]) for r in rows}
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT model,
+                          SUM(prompt_tokens)     AS p,
+                          SUM(completion_tokens) AS c,
+                          MAX(prompt_tokens)     AS peak
+                   FROM llm_usage
+                   WHERE user_id = %s AND session_id = %s
+                   GROUP BY model
+                   ORDER BY MIN(id)""",
+                (user_id, session_id),
+            )
+            rows = cur.fetchall()
+    return {
+        r["model"]: (int(r["p"] or 0), int(r["c"] or 0), int(r["peak"] or 0))
+        for r in rows
+    }
 
 
 def get_preferred_model(user_id: int) -> str | None:
     with closing(get_connection()) as conn:
-        row = conn.execute(
-            "SELECT preferred_model FROM users WHERE id = ?", (user_id,)
-        ).fetchone()
-    return row["preferred_model"] if row else None
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT preferred_model FROM users WHERE id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return row["preferred_model"]
 
 
 def set_preferred_model(user_id: int, model: str) -> None:
     with closing(get_connection()) as conn:
-        conn.execute(
-            "UPDATE users SET preferred_model = ? WHERE id = ?", (model, user_id)
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET preferred_model = %s WHERE id = %s",
+                (model, user_id),
+            )
         conn.commit()

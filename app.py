@@ -30,8 +30,6 @@ st.markdown("""
     section[data-testid="stSidebar"] {
         min-width: 300px !important;
     }
-    /* Hide Streamlit's native collapse handle only while sidebar is open */
-    /* (kept visible by default; we don't touch it) */
 
     /* Left-aligned sidebar buttons */
     section[data-testid="stSidebar"] button {
@@ -56,7 +54,7 @@ st.markdown("""
         align-items: center;
         gap: 8px;
         margin-bottom: 6px;
-        min-width: 0; /* allow children to shrink */
+        min-width: 0;
     }
     .sb-avatar {
         width: 32px;
@@ -72,7 +70,7 @@ st.markdown("""
         flex-shrink: 0;
     }
     .sb-user-meta {
-        min-width: 0; /* required for text-overflow on children */
+        min-width: 0;
         font-size: 0.85rem;
     }
     .sb-username {
@@ -102,6 +100,8 @@ init_db()
 PENDING_TOPIC_LABEL = "Uploaded – choose a topic"
 
 # ── Session state ─────────────────────────────────────────────────────────────
+# `user` isn't available yet (require_login runs later); the model default uses
+# the env var and gets corrected below once we know who's logged in.
 
 for _k, _v in {
     "agent": None,
@@ -123,13 +123,8 @@ for _k, _v in {
     "_rag_cache": {},
     "_docs_cache": None,
     "_doc_meta_cache": {},
-    "model": (
-        _preferred if (_preferred := history.get_preferred_model(user["id"])) in MODEL_OPTIONS
-        else os.getenv("MODEL")
-    ),
-    # How many entries of agent.usage are already written to llm_usage
+    "model": os.getenv("MODEL"),
     "usage_saved": 0,
-    # The last evaluated (question, answer) pair, kept so another model can re-judge it
     "last_eval": None,
 }.items():
     if _k not in st.session_state:
@@ -216,19 +211,30 @@ def _set_mistakes(mistakes: list, doc: str | None = None) -> None:
 
 def _save_usage():
     """Write LLM calls made since the last save to llm_usage."""
+    user = st.session_state.get("user")
     agent = st.session_state.agent
-    if not agent:
+    if not user or not agent or not hasattr(agent, "usage"):
         return
-    history.record_usage(
-        user["id"],
-        st.session_state.current_session_id,
-        agent.usage[st.session_state.usage_saved:],
-    )
-    st.session_state.usage_saved = len(agent.usage)
+    try:
+        history.record_usage(
+            user["id"],
+            st.session_state.current_session_id,
+            agent.usage[st.session_state.usage_saved:],
+        )
+        st.session_state.usage_saved = len(agent.usage)
+    except Exception:
+        # If the colleague's usage helpers aren't available, don't crash the app.
+        pass
 
 
 def _save_preferred_model():
-    history.set_preferred_model(user["id"], st.session_state.model)
+    user = st.session_state.get("user")
+    if not user:
+        return
+    try:
+        history.set_preferred_model(user["id"], st.session_state.model)
+    except Exception:
+        pass
 
 
 def _persist():
@@ -321,10 +327,10 @@ def _dlg_logout():
             _close_dialog()
     with col2:
         if st.button("Log out", type="primary", use_container_width=True):
+            _save_usage()
             st.session_state["_pending_dialog"] = None
             logout()
 
-    _save_usage()
 
 @st.dialog("Delete document?")
 def _dlg_delete_document(name: str):
@@ -466,6 +472,15 @@ if user is None:
     st.stop()
 st.session_state["user"] = user
 
+# Restore the user's preferred model once we know who they are. Wrap in a
+# try/except so a missing history helper doesn't crash the app.
+try:
+    preferred = history.get_preferred_model(user["id"])
+except Exception:
+    preferred = None
+if preferred in MODEL_OPTIONS:
+    st.session_state.model = preferred
+
 _dispatch_dialog()
 
 
@@ -482,11 +497,16 @@ def _handle_upload(uploaded_file) -> None:
     existing_meta = history.load_document_meta(user["id"], doc_name)
     if existing_meta and existing_meta["topics"]:
         topics = existing_meta["topics"]
-        _get_rag(doc_name, text)
+        _get_rag(doc_name, text)  # pre-warm the cache
     else:
         rag = _get_rag(doc_name, text)
         agent = StudyBuddyAgent(text, rag)
+        if st.session_state.model:
+            agent.model = st.session_state.model
         topics = agent.extract_topics()
+        st.session_state.agent = agent
+        st.session_state.usage_saved = 0
+        _save_usage()  # topic extraction belongs to no study session yet
 
     hidden = history.get_hidden_topics(user["id"], doc_name)
     topics = [t for t in topics if t not in hidden]
@@ -503,14 +523,6 @@ def _handle_upload(uploaded_file) -> None:
     st.session_state.active_document = doc_name
     st.session_state.last_filename = doc_name
     st.session_state.document_text = text
-    rag = RAGIndex(text)
-    agent = StudyBuddyAgent(text, rag)
-    agent.model = st.session_state.model or agent.model
-    topics = agent.extract_topics()
-    st.session_state.agent = agent
-    st.session_state.usage_saved = 0
-    st.session_state.current_session_id = None
-    _save_usage()  # topic extraction belongs to no study session yet
     st.session_state.topics = topics
     st.session_state.agent = None
     st.session_state.conversation = []
@@ -518,6 +530,7 @@ def _handle_upload(uploaded_file) -> None:
     st.session_state.active_topic = None
     st.session_state.app_state = "document_open"
     st.session_state.session_is_pending = False
+    st.session_state.last_eval = None
     _set_mistakes([], doc_name)
 
 
@@ -530,13 +543,12 @@ def _select_topic(topic: str) -> None:
     meta = _get_doc_meta(doc)
     existing = _find_session_in_meta(meta, topic)
     st.session_state.last_eval = None
-    st.session_state.app_state = "topic_select"
-    st.session_state.last_filename = uploaded_file.name
-    return len(text), topics
 
     if existing:
         rag = _get_rag(doc, meta["document_text"])
         agent = StudyBuddyAgent(meta["document_text"], rag)
+        if st.session_state.model:
+            agent.model = st.session_state.model
         agent.concepts = existing["concepts"]
         agent.current_topic = existing["topic"]
         agent.current_concept = existing["current_concept"]
@@ -550,6 +562,7 @@ def _select_topic(topic: str) -> None:
         st.session_state.current_session_id = existing["id"]
         st.session_state.session_is_pending = False
         st.session_state.active_topic = topic
+        st.session_state.usage_saved = 0
 
         if agent.topic_complete:
             st.session_state.app_state = "mastered"
@@ -560,6 +573,8 @@ def _select_topic(topic: str) -> None:
 
     rag = _get_rag(doc, st.session_state.document_text)
     agent = StudyBuddyAgent(st.session_state.document_text, rag)
+    if st.session_state.model:
+        agent.model = st.session_state.model
     question = agent.start_topic(topic)
     n_concepts = len(agent.concepts)
 
@@ -577,8 +592,8 @@ def _select_topic(topic: str) -> None:
     ]
     st.session_state.agent = agent
     st.session_state.active_topic = topic
-    st.session_state.last_eval = None
     st.session_state.app_state = "questioning"
+    st.session_state.usage_saved = 0
 
     placeholder = _find_placeholder_in_meta(meta)
     if placeholder:
@@ -597,40 +612,13 @@ def _select_topic(topic: str) -> None:
             _get_mistakes(), agent.current_concept, agent.current_question,
             agent.follow_up_count,
         )
-    _save_usage()
 
+    _save_usage()
     _invalidate_docs_cache()
     _invalidate_doc_meta(doc)
 
-    rag = RAGIndex(saved["document_text"])
-    agent = StudyBuddyAgent(saved["document_text"], rag)
-    agent.model = st.session_state.model or agent.model
-    agent.concepts = saved["concepts"]
-    agent.current_topic = saved["topic"]
-    agent.current_concept = saved["current_concept"]
-    agent.current_question = saved["current_question"]
-    agent.follow_up_count = saved["follow_up_count"]
-    agent.asked_questions = [
-        m["content"] for m in saved["conversation"] if m["type"] == "question"
-    ]
 
 # ── Renderers ─────────────────────────────────────────────────────────────────
-    st.session_state.agent = agent
-    st.session_state.usage_saved = 0
-    st.session_state.topics = [saved["topic"]]
-    st.session_state.conversation = saved["conversation"]
-    st.session_state.mistakes_by_user[user["id"]] = saved["mistakes"]
-    st.session_state.document_text = saved["document_text"]
-    st.session_state.last_filename = saved["document_name"]
-    st.session_state.current_session_id = session_id
-    st.session_state.last_eval = None
-
-    if agent.topic_complete:
-        st.session_state.app_state = "mastered"
-    else:
-        last_type = saved["conversation"][-1]["type"] if saved["conversation"] else None
-        st.session_state.app_state = "questioning" if last_type == "question" else "feedback"
-
 
 def _render_progress():
     agent = st.session_state.agent
@@ -669,26 +657,27 @@ def _render_conversation():
                 _render_feedback(f"**Second opinion: {score}** — {msg['content']}", score)
             else:
                 st.markdown(msg["content"])
-            # Sessions saved before model selection existed have no "model" key
             if msg.get("model"):
                 st.caption(f"🤖 {msg['model']}")
 
 
 def _context_share(model: str, prompt_tokens: int) -> float | None:
-    """Share of the model's input limit that one request used, if the limit is known."""
     limit = MODEL_OPTIONS.get(model)
     return prompt_tokens / limit if limit else None
 
 
 def _render_usage():
+    user = st.session_state["user"]
     agent: StudyBuddyAgent = st.session_state.agent
     session_id = st.session_state.current_session_id
+    per_model = {}
     if session_id:
-        # Read from the DB so the totals include earlier visits to this session
-        per_model = history.usage_by_model(user["id"], session_id)
-    else:
-        per_model = {}
-        for u in agent.usage if agent else []:
+        try:
+            per_model = history.usage_by_model(user["id"], session_id)
+        except Exception:
+            per_model = {}
+    if not per_model:
+        for u in (agent.usage if agent and hasattr(agent, "usage") else []):
             tin, tout, peak = per_model.get(u["model"], (0, 0, 0))
             per_model[u["model"]] = (
                 tin + u["prompt_tokens"],
@@ -706,14 +695,12 @@ def _render_usage():
         for name, (tin, tout, _) in per_model.items():
             st.caption(f"🤖 {name}: {tin:,} in · {tout:,} out")
 
-    # Every call is sent without chat history, so what a model has to read is
-    # one request, not the session total. The largest request is the one at risk.
     shares = {
         name: share
         for name, (_, _, peak) in per_model.items()
         if (share := _context_share(name, peak)) is not None
     }
-    if agent and agent.usage:
+    if agent and hasattr(agent, "usage") and agent.usage:
         last = agent.usage[-1]
         share = _context_share(last["model"], last["prompt_tokens"])
         if share is not None:
@@ -732,7 +719,7 @@ def _render_usage():
 
 
 def _other_models() -> list[str]:
-    current = st.session_state.agent.model
+    current = st.session_state.agent.model if st.session_state.agent else st.session_state.model
     return [m for m in MODEL_OPTIONS if m != current]
 
 
@@ -758,6 +745,7 @@ def _render_model_actions():
                     st.session_state.conversation.append(
                         {"role": "assistant", "content": q, "type": "question", "model": model}
                     )
+                    _save_usage()
                     _persist()
                     st.rerun()
     if last_eval:
@@ -781,6 +769,7 @@ def _render_model_actions():
                             "model": model,
                         }
                     )
+                    _save_usage()
                     _persist()
                     st.rerun()
 
@@ -800,8 +789,8 @@ def _render_topics_tab():
         sessions_by_topic.setdefault(s["topic"], s)
 
     for topic in st.session_state.topics:
-        col1, col2 = st.columns([6, 1])
-        with col1:
+        with st.container(horizontal=True, horizontal_alignment="distribute",
+                          vertical_alignment="center"):
             s = sessions_by_topic.get(topic)
             status = ""
             if s:
@@ -817,7 +806,6 @@ def _render_topics_tab():
             if st.button(label, key=f"open_topic_{topic}", use_container_width=True):
                 st.session_state.pending_topic = topic
                 st.rerun()
-        with col2:
             if st.button("🙈", key=f"hide_{topic}", help="Hide this topic and delete its sessions"):
                 st.session_state["_pending_dialog"] = {"kind": "hide_topic", "topic": topic}
                 st.rerun()
@@ -832,14 +820,14 @@ def _render_review_tab():
         answer = m["answer"]
         if len(answer) > 200:
             answer = answer[:200].rstrip() + "…"
-        col1, col2 = st.columns([5, 1])
-        with col1:
-            st.markdown(f"**{i}. {m['question']}**")
-            st.caption(" · ".join(filter(None, [m["topic"], m["score"], m.get("model")])))
-            st.markdown(f"Your answer: {answer}")
-            if m.get("missing"):
-                st.markdown(f"Missing: {m['missing']}")
-        with col2:
+        with st.container(horizontal=True, horizontal_alignment="distribute",
+                          vertical_alignment="top"):
+            with st.container():
+                st.markdown(f"**{i}. {m['question']}**")
+                st.caption(" · ".join(filter(None, [m.get("topic", ""), m.get("score", ""), m.get("model", "")])))
+                st.markdown(f"Your answer: {answer}")
+                if m.get("missing"):
+                    st.markdown(f"Missing: {m['missing']}")
             if st.button("🗑️", key=f"del_mistake_{i}"):
                 st.session_state["_pending_dialog"] = {"kind": "delete_mistake", "index": i - 1}
                 st.rerun()
@@ -858,10 +846,9 @@ def _render_hidden_tab():
         st.caption("No hidden topics for this document.")
         return
     for topic in hidden_list:
-        col1, col2 = st.columns([5, 1])
-        with col1:
+        with st.container(horizontal=True, horizontal_alignment="distribute",
+                          vertical_alignment="center"):
             st.markdown(topic)
-        with col2:
             if st.button("👁️", key=f"unhide_{topic}", help="Unhide this topic"):
                 history.unhide_topic(user["id"], doc, topic)
                 if topic not in st.session_state.topics:
@@ -886,7 +873,7 @@ if st.session_state.pending_topic is not None:
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    header_col1, header_col2 = st.columns([3, 2])
+    header_col1, header_col2 = st.columns([3, 2], vertical_alignment="top")
     with header_col1:
         st.markdown("### 📚 StudyBuddy")
         st.caption("AI Learning Partner")
@@ -894,25 +881,20 @@ with st.sidebar:
         initials = "".join(part[0].upper() for part in user["username"].split()[:2]) or user["username"][:2].upper()
         st.markdown(
             f"""
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-                <div style="
-                    width:32px;height:32px;border-radius:50%;
-                    background:linear-gradient(135deg,#4f46e5,#7c3aed);
-                    color:white;display:flex;align-items:center;justify-content:center;
-                    font-weight:600;font-size:13px;">
-                    {initials}
-                </div>
-                <div style="font-size:0.85rem;">
-                    <div style="font-weight:600;">{user["username"]}</div>
-                    <div style="color:#8a8a8a;font-size:0.75rem;">{user["email"]}</div>
+            <div class="sb-user-badge">
+                <div class="sb-avatar">{initials}</div>
+                <div class="sb-user-meta">
+                    <div class="sb-username" title="{user['username']}">{user['username']}</div>
+                    <div class="sb-useremail" title="{user['email']}">{user['email']}</div>
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        if st.button("Log out", use_container_width=True):
-            st.session_state["_pending_dialog"] = {"kind": "logout"}
-            st.rerun()
+
+    if st.button("🚪 Log out", use_container_width=True):
+        st.session_state["_pending_dialog"] = {"kind": "logout"}
+        st.rerun()
 
     st.divider()
 
@@ -958,20 +940,19 @@ with st.sidebar:
         name = d["document_name"]
         is_active = (name == st.session_state.active_document)
         label = ("▶ " if is_active else "📄 ") + name
-        col1, col2 = st.columns([6, 1])
-        with col1:
+        with st.container(horizontal=True, horizontal_alignment="distribute",
+                          vertical_alignment="center"):
             if st.button(label, key=f"open_doc_{name}", use_container_width=True):
                 if not is_active:
                     _open_document(name)
                     st.rerun()
-        with col2:
             if st.button("🗑️", key=f"del_doc_{name}", help="Dieses Dokument und alle zugehörigen Sessions löschen"):
                 st.session_state["_pending_dialog"] = {"kind": "delete_document", "name": name}
                 st.rerun()
 
     st.divider()
     render_stay_signed_in_help()
-    st.caption(f"Model: {os.getenv('MODEL', 'not configured')}")
+    st.caption(f"Model: {st.session_state.model or os.getenv('MODEL', 'not configured')}")
     with st.expander("📊 Token usage"):
         _render_usage()
 
@@ -1057,8 +1038,8 @@ elif state in ("questioning", "feedback", "mastered"):
                     "answer": answer,
                     "missing": result.get("missing"),
                     "score": score,
-                "model": agent.model,
-                    })
+                    "model": agent.model,
+                })
                 _set_mistakes(current)
 
             if agent.topic_complete:
@@ -1066,8 +1047,8 @@ elif state in ("questioning", "feedback", "mastered"):
                     "role": "assistant",
                     "content": f"Correct! {feedback}" if score == "correct" else feedback,
                     "type": "feedback", "score": score,
-                "model": agent.model,
-                    })
+                    "model": agent.model,
+                })
                 st.session_state.conversation.append({
                     "role": "assistant",
                     "content": f"🎉 You've explained all key concepts of **{agent.current_topic}** — topic mastered!",
@@ -1080,23 +1061,28 @@ elif state in ("questioning", "feedback", "mastered"):
                     "role": "assistant",
                     "content": f"Correct! {feedback}",
                     "type": "feedback", "score": "correct",
-                "model": agent.model,})
+                    "model": agent.model,
+                })
                 st.session_state.app_state = "feedback"
             elif follow_up:
                 st.session_state.conversation.append({
-                    "role": "assistant", "content": feedback, "type": "feedback", "score": score, "model": agent.model
+                    "role": "assistant", "content": feedback, "type": "feedback",
+                    "score": score, "model": agent.model,
                 })
                 st.session_state.conversation.append({
-                    "role": "assistant", "content": follow_up, "type": "question", "model": agent.model
+                    "role": "assistant", "content": follow_up, "type": "question",
+                    "model": agent.model,
                 })
             else:
                 st.session_state.conversation.append({
                     "role": "assistant",
                     "content": f"{feedback} Let's approach this from another angle.",
                     "type": "feedback", "score": score,
-                "model": agent.model,})
+                    "model": agent.model,
+                })
                 st.session_state.app_state = "feedback"
 
+            _save_usage()
             _persist()
             st.rerun()
 
@@ -1111,9 +1097,11 @@ elif state in ("questioning", "feedback", "mastered"):
                         st.error(f"The AI service did not respond ({e}). Please try again.")
                         st.stop()
                 st.session_state.conversation.append(
-                    {"role": "assistant", "content": q, "type": "question", "model": st.session_state.agent.model}
+                    {"role": "assistant", "content": q, "type": "question",
+                     "model": st.session_state.agent.model}
                 )
                 st.session_state.app_state = "questioning"
+                _save_usage()
                 _persist()
                 st.rerun()
         with col2:

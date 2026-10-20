@@ -32,11 +32,16 @@ def init_db() -> None:
     ) as f:
         with conn.cursor() as cur:
             cur.execute(f.read())
-        # CREATE TABLE IF NOT EXISTS does not add columns to an existing users
-        # table, so databases created before this column existed are migrated here.
-        columns = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
-        if "preferred_model" not in columns:
-            conn.execute("ALTER TABLE users ADD COLUMN preferred_model TEXT")
+            # CREATE TABLE IF NOT EXISTS does not add columns to an existing
+            # users table, so databases created before this column existed are
+            # migrated here. Postgres uses information_schema, not PRAGMA.
+            cur.execute(
+                """SELECT column_name
+                   FROM information_schema.columns
+                   WHERE table_name = 'users' AND column_name = 'preferred_model'"""
+            )
+            if cur.fetchone() is None:
+                cur.execute("ALTER TABLE users ADD COLUMN preferred_model TEXT")
         conn.commit()
 
 

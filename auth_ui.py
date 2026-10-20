@@ -168,13 +168,8 @@ def _login_form() -> None:
             _set_cookie_and_reload(token)
         _set_token(token)
     else:
-        # Session-only: keep token in memory, don't write it to URL/cookie.
-        # The user will have to log in again on a fresh tab.
         if USE_COOKIE:
             _set_cookie_and_reload(token)
-        # For URL mode, we still set the token so the current page works;
-        # clearing it on tab close isn't possible without JS, so we accept
-        # the "always persisted" behaviour and rely on logout.
         _set_token(token)
 
     st.toast(f"Willkommen zurück, {user['username']}!", icon="👋")
@@ -278,21 +273,13 @@ def logout() -> None:
 
 
 def render_stay_signed_in_help() -> None:
-    """Small sidebar helper showing the current login URL + copy button."""
+    """Small sidebar helper showing the current login token + copy button."""
     token = _get_token()
     if not token:
         return
     with st.expander("🔗 Stay signed in on new tabs"):
         st.caption(
-            "Save this URL as a bookmark — opening it in a new tab keeps "
+            "Save this token in a bookmark — opening it in a new tab keeps "
             "you logged in."
         )
-        # Build a bookmark-friendly URL with the token
-        try:
-            base = st.experimental_get_query_params()  # legacy fallback
-        except Exception:
-            base = {}
-        st.code(
-            f"{TOKEN_PARAM}={token}",
-            language=None,
-        )
+        st.code(f"{TOKEN_PARAM}={token}", language=None)

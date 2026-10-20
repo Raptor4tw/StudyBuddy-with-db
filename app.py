@@ -22,15 +22,73 @@ st.set_page_config(page_title="StudyBuddy", page_icon="📚", layout="wide")
 
 st.markdown("""
 <style>
+    /* Keep sidebar wide enough that buttons/icons never get clipped */
+    section[data-testid="stSidebar"] {
+        min-width: 300px !important;
+    }
+    /* Hide Streamlit's native collapse handle only while sidebar is open */
+    /* (kept visible by default; we don't touch it) */
+
+    /* Left-aligned sidebar buttons */
     section[data-testid="stSidebar"] button {
         text-align: left;
         justify-content: flex-start;
     }
+    section[data-testid="stSidebar"] .stButton > button {
+        font-size: 0.9rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    /* Chat bubbles */
     div[data-testid="stChatMessage"] {
         border-radius: 10px;
     }
-    section[data-testid="stSidebar"] .stButton > button {
-        font-size: 0.9rem;
+
+    /* User badge: name truncates with ellipsis instead of wrapping/overflowing */
+    .sb-user-badge {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 6px;
+        min-width: 0; /* allow children to shrink */
+    }
+    .sb-avatar {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #4f46e5, #7c3aed);
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 600;
+        font-size: 13px;
+        flex-shrink: 0;
+    }
+    .sb-user-meta {
+        min-width: 0; /* required for text-overflow on children */
+        font-size: 0.85rem;
+    }
+    .sb-username {
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .sb-useremail {
+        color: #8a8a8a;
+        font-size: 0.75rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    /* Document/topic rows: stretch main button, keep icon button compact */
+    section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
+        align-items: center;
+        gap: 4px;
     }
 </style>
 """, unsafe_allow_html=True)

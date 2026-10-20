@@ -4,7 +4,7 @@
 torch>=2.2.0
 
 openai>=1.54.0
-streamlit==1.49.1  # 1.58 replaced the classic default chat avatars
+streamlit==1.58.0  # 1.58 replaced the classic default chat avatars
 python-dotenv>=1.0.0
 sentence-transformers>=3.0.0
 faiss-cpu>=1.7.4

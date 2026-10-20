@@ -1,22 +1,24 @@
 # StudyBuddy - AI Learning Partner
 
-An AI-powered study assistant that quizzes you on your own lecture materials using RAG and LLM feedback.
-
-**[▶ Try the live app](https://studybuddy-ibrahim-zarouri.streamlit.app)** · **[Project website](https://ibrahimzarouri.github.io/study-buddy/)** · **[Technical documentation](DOCUMENTATION.md)**
-
-No setup needed to try it: open the live app, upload a lecture PDF, and start explaining.
-
 ## How it works
 
-1. Upload your lecture notes or slides (PDF, Word, or plain text)
-2. StudyBuddy extracts the main topics automatically
-3. Select a topic - StudyBuddy asks you a comprehension question based on your material
-4. Explain the concept in your own words
-5. Get instant feedback and targeted follow-up questions until the topic is mastered
+1. **Sign up or log in** (sessions persist across reloads and new tabs via a bookmarkable URL).
+2. **Upload your lecture notes or slides** (PDF, Word, or plain text) — each document becomes its own chat.
+3. **StudyBuddy extracts the main topics automatically** (once per document, reused on later visits).
+4. **Select a topic** — StudyBuddy asks you a comprehension question based strictly on your material.
+5. **Explain the concept in your own words.**
+6. **Get instant feedback** and targeted follow-up questions until every key concept of the topic is mastered.
 
-Anything you answer only partially or get wrong is collected in a **review list** in the
-sidebar - with the question, your answer, and the concept you missed - so you can come
-back to it after moving on to other topics.
+### Features
+
+- **Per-user study sessions** — every document, topic, conversation and mistake list is persisted in Postgres (Supabase) and tied to your account. Resume any session after a reload, a browser restart, or on another device.
+- **Review list** — anything you answer partially or incorrectly is collected per document, with the question, your answer, and the concept you missed, so you can come back to it later.
+- **DeepSeek-style UI** — the sidebar lists your documents as chats; each topic inside a document opens its own conversation with a back button.
+- **Multi-model support** — pick your preferred model from the sidebar; ask another model for a fresh question or a second opinion on your last answer without changing your progress.
+- **Token-usage tracking** — see how many tokens each model used this session, with a warning when a single request approaches the model's input limit.
+- **Confirmation dialogs** for every destructive action (log out, delete document, hide topic, delete mistake, clear review list, restart topic).
+- **Hidden topics** — delete a topic to remove its sessions and keep it out of future document loads; restore it from the Hidden tab.
+- **Fast UI** — the embedding index and document metadata are cached, so clicking a topic is near-instant after the first load.
 
 ## Setup
 
@@ -47,6 +49,9 @@ Then open `.env` and set your values:
 API_KEY=your-api-key-here
 BASE_URL=https://chat.kiconnect.nrw/api/v1
 MODEL=OpenAI-GPT-5-Mini
+SUPABASE_DB_URL=postgresql://postgres.<ref>:<password>@<host>.pooler.supabase.com:5432/postgres
+MODELS="OpenAI-GPT-5-Mini|272000,OpenAI_GPT-5.2|272000,OpenAI-GPT5.5,OpenAI GPT OSS 120B|131072,Mistral Small 4 119B|1048576,Qwen3.8-27b-API|262144"
+CONTEXT_WARN_SHARE=0.4
 ```
 
 > If you are using a different OpenAI-compatible API, replace `BASE_URL` and `MODEL` accordingly.
@@ -103,9 +108,12 @@ The app is deployed on [Streamlit Community Cloud](https://share.streamlit.io), 
 3. Under **Advanced settings**, paste your credentials into **Secrets**:
 
    ```toml
-   API_KEY = "your-api-key"
+   API_KEY = "your-api-key-here"
    BASE_URL = "https://chat.kiconnect.nrw/api/v1"
    MODEL = "OpenAI-GPT-5-Mini"
+   SUPABASE_DB_URL = "postgresql://postgres.<ref>:<password>@<host>.pooler.supabase.com:5432/postgres"
+   MODELS = "OpenAI-GPT-5-Mini|272000,OpenAI_GPT-5.2|272000,OpenAI-GPT5.5,OpenAI GPT OSS 120B|131072,Mistral Small 4 119B|1048576,Qwen3.8-27b-API|262144"
+   CONTEXT_WARN_SHARE = 0.4
    ```
 
 4. Click **Deploy**.

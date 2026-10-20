@@ -671,7 +671,7 @@ Contributed via commits to this repository, verifiable against `git log`.
 | Persistent login sessions: URL-token based (survives new tabs and browser restarts), optional cookie path behind a `USE_COOKIE` flag; expired-session cleanup on login | `auth.py`, `auth_ui.py` |
 | Database schema for users, login sessions, study sessions, hidden topics and LLM usage (Postgres / Supabase) | `schema.sql` |
 | Per-user study-session persistence (resume, delete past sessions across topics/documents), scoped mistakes per (user, document), single-roundtrip document metadata loader | `history.py`, `schema.sql` |
-| DeepSeek-style chat UI: sidebar lists uploaded documents, per-document Topics / Review / Hidden tabs, per-topic chat view with back navigation, one session per (document, topic) | `app.py` |
+| AI Model-style chat UI: sidebar lists uploaded documents, per-document Topics / Review / Hidden tabs, per-topic chat view with back navigation, one session per (document, topic) | `app.py` |
 | Confirmation dialogs (`st.dialog` decorator + single pending-action dispatcher) for logout, delete document, hide topic, delete mistake, clear review list, restart topic | `app.py` |
 | Performance: `RAGIndex` cached via `st.cache_resource` and pre-warmed on upload; document list and document metadata cached in `session_state`; `load_document_meta()` replaces N+1 `load_session()` calls | `app.py`, `history.py` |
 | Model selector and preferred-model persistence per user; per-call token-usage tracking with per-model totals and context-limit warnings; "second opinion" and "new question from another model" actions | `agent/models.py`, `history.py`, `agent/study_agent.py`, `app.py`, `schema.sql` |

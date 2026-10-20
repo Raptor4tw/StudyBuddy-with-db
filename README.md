@@ -13,8 +13,8 @@
 
 - **Per-user study sessions** — every document, topic, conversation and mistake list is persisted in Postgres (Supabase) and tied to your account. Resume any session after a reload, a browser restart, or on another device.
 - **Review list** — anything you answer partially or incorrectly is collected per document, with the question, your answer, and the concept you missed, so you can come back to it later.
-- **DeepSeek-style UI** — the sidebar lists your documents as chats; each topic inside a document opens its own conversation with a back button.
-- **Multi-model support** — pick your preferred model from the sidebar; ask another model for a fresh question or a second opinion on your last answer without changing your progress.
+- **AI Model-style UI** — the sidebar lists your documents as chats; each topic inside a document opens its own conversation with a back button.
+- **Multimodel support** — pick your preferred model from the sidebar; ask another model for a fresh question or a second opinion on your last answer without changing your progress.
 - **Token-usage tracking** — see how many tokens each model used this session, with a warning when a single request approaches the model's input limit.
 - **Confirmation dialogs** for every destructive action (log out, delete document, hide topic, delete mistake, clear review list, restart topic).
 - **Hidden topics** — delete a topic to remove its sessions and keep it out of future document loads; restore it from the Hidden tab.

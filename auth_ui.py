@@ -31,7 +31,7 @@ COOKIE_EXPIRY_DAYS = 30
 
 
 def _set_cookie_and_reload(token: str) -> None:
-    components.html(
+    st.iframe(
         f"""<script>
         try {{
             const secure = window.parent.location.protocol === "https:" ? "; Secure" : "";
@@ -41,13 +41,13 @@ def _set_cookie_and_reload(token: str) -> None:
         }}
         window.parent.location.reload();
         </script>""",
-        height=0,
-        width=0,
+        height=1,
+        width=1,
     )
 
 
 def _clear_cookie_and_reload() -> None:
-    components.html(
+    st.iframe(
         f"""<script>
         try {{
             window.parent.document.cookie = "{COOKIE_NAME}=; max-age=0; path=/; SameSite=Lax";
@@ -56,8 +56,8 @@ def _clear_cookie_and_reload() -> None:
         }}
         window.parent.location.reload();
         </script>""",
-        height=0,
-        width=0,
+        height=1,
+        width=1,
     )
 
 

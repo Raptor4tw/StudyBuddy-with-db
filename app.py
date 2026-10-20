@@ -9,7 +9,7 @@ from agent.study_agent import StudyBuddyAgent
 from tools.document_loader import load_document
 from tools.rag import RAGIndex
 from auth import init_db
-from auth_ui import require_login, logout
+from auth_ui import require_login, logout, render_stay_signed_in_help
 import history
 
 try:
@@ -22,21 +22,80 @@ st.set_page_config(page_title="StudyBuddy", page_icon="📚", layout="wide")
 
 st.markdown("""
 <style>
+    /* Keep sidebar wide enough that buttons/icons never get clipped */
+    section[data-testid="stSidebar"] {
+        min-width: 300px !important;
+    }
+    /* Hide Streamlit's native collapse handle only while sidebar is open */
+    /* (kept visible by default; we don't touch it) */
+
+    /* Left-aligned sidebar buttons */
     section[data-testid="stSidebar"] button {
         text-align: left;
         justify-content: flex-start;
     }
+    section[data-testid="stSidebar"] .stButton > button {
+        font-size: 0.9rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    /* Chat bubbles */
     div[data-testid="stChatMessage"] {
         border-radius: 10px;
+    }
+
+    /* User badge: name truncates with ellipsis instead of wrapping/overflowing */
+    .sb-user-badge {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 6px;
+        min-width: 0; /* allow children to shrink */
+    }
+    .sb-avatar {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #4f46e5, #7c3aed);
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 600;
+        font-size: 13px;
+        flex-shrink: 0;
+    }
+    .sb-user-meta {
+        min-width: 0; /* required for text-overflow on children */
+        font-size: 0.85rem;
+    }
+    .sb-username {
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .sb-useremail {
+        color: #8a8a8a;
+        font-size: 0.75rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    /* Document/topic rows: stretch main button, keep icon button compact */
+    section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
+        align-items: center;
+        gap: 4px;
     }
 </style>
 """, unsafe_allow_html=True)
 
 init_db()
-user = st.session_state.get("user") or require_login()
-if user is None:
-    st.stop()
-st.session_state["user"] = user
+
+PENDING_TOPIC_LABEL = "Uploaded – choose a topic"
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -44,7 +103,9 @@ for _k, _v in {
     "agent": None,
     "topics": [],
     "conversation": [],
-    "app_state": "upload",
+    "app_state": "no_document",
+    "active_document": None,
+    "active_topic": None,
     "last_filename": None,
     "celebrate": False,
     "mistakes_by_user": {},
@@ -54,24 +115,97 @@ for _k, _v in {
     "_uploader_had_file": False,
     "_uploader_key": 0,
     "session_is_pending": False,
+    "_pending_dialog": None,
+    "_rag_cache": {},
+    "_docs_cache": None,
+    "_doc_meta_cache": {},
 }.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-PENDING_TOPIC_LABEL = "Uploaded – choose a topic"
+
+# ── Helper functions ─────────────────────────────────────────────────────────
+
+@st.cache_resource(show_spinner=False)
+def _build_rag_cached(doc_name: str, document_text: str) -> RAGIndex:
+    return RAGIndex(document_text)
 
 
-def _get_mistakes() -> list:
-    """Mistakes scoped by (user, current document) — never shared across unrelated PDFs."""
-    return st.session_state.mistakes_by_user.get(user["id"], {}).get(st.session_state.last_filename, [])
+def _get_rag(doc_name: str, document_text: str) -> RAGIndex:
+    cache = st.session_state._rag_cache
+    if doc_name in cache:
+        return cache[doc_name]
+    with st.spinner("Loading document model… (first time only)"):
+        rag = _build_rag_cached(doc_name, document_text)
+    cache[doc_name] = rag
+    return rag
 
 
-def _set_mistakes(mistakes: list) -> None:
-    st.session_state.mistakes_by_user.setdefault(user["id"], {})[st.session_state.last_filename] = mistakes
+def _invalidate_docs_cache():
+    st.session_state._docs_cache = None
+
+
+def _invalidate_doc_meta(doc_name: str | None = None):
+    if doc_name is None:
+        st.session_state._doc_meta_cache.clear()
+    else:
+        st.session_state._doc_meta_cache.pop(doc_name, None)
+
+
+def _invalidate_rag(doc_name: str | None = None):
+    if doc_name is None:
+        st.session_state._rag_cache.clear()
+    else:
+        st.session_state._rag_cache.pop(doc_name, None)
+    try:
+        _build_rag_cached.clear()
+    except Exception:
+        pass
+
+
+def _get_doc_meta(doc_name: str) -> dict | None:
+    user = st.session_state.get("user")
+    if not user:
+        return None
+    cache = st.session_state._doc_meta_cache
+    if doc_name not in cache:
+        cache[doc_name] = history.load_document_meta(user["id"], doc_name)
+    return cache[doc_name]
+
+
+def _get_docs() -> list[dict]:
+    user = st.session_state.get("user")
+    if not user:
+        return []
+    if st.session_state._docs_cache is None:
+        st.session_state._docs_cache = history.list_documents(user["id"])
+    return st.session_state._docs_cache
+
+
+def _get_mistakes(doc: str | None = None) -> list:
+    user = st.session_state.get("user")
+    if not user:
+        return []
+    doc = doc or st.session_state.active_document
+    if not doc:
+        return []
+    return st.session_state.mistakes_by_user.get(user["id"], {}).get(doc, [])
+
+
+def _set_mistakes(mistakes: list, doc: str | None = None) -> None:
+    user = st.session_state.get("user")
+    if not user:
+        return
+    doc = doc or st.session_state.active_document
+    if not doc:
+        return
+    st.session_state.mistakes_by_user.setdefault(user["id"], {})[doc] = mistakes
 
 
 def _persist():
-    """Save the current conversation/mistakes/concepts to the active session row."""
+    user = st.session_state.get("user")
+    if not user:
+        return
     if not st.session_state.current_session_id or not st.session_state.agent:
         return
     agent = st.session_state.agent
@@ -85,49 +219,308 @@ def _persist():
         agent.current_question,
         agent.follow_up_count,
     )
+    _invalidate_doc_meta(st.session_state.active_document)
 
 
-def _load_file(uploaded_file):
+def _find_session_in_meta(meta: dict | None, topic: str) -> dict | None:
+    if not meta:
+        return None
+    for s in meta["sessions"]:
+        if s["topic"] == topic:
+            return s
+    return None
+
+
+def _find_placeholder_in_meta(meta: dict | None) -> dict | None:
+    return _find_session_in_meta(meta, PENDING_TOPIC_LABEL)
+
+
+def _open_document(document_name: str) -> None:
+    user = st.session_state.get("user")
+    if not user:
+        return
+    meta = _get_doc_meta(document_name)
+    if not meta:
+        st.error("Document not found.")
+        return
+
+    st.session_state.active_document = document_name
+    st.session_state.last_filename = document_name
+    st.session_state.document_text = meta["document_text"]
+
+    hidden = history.get_hidden_topics(user["id"], document_name)
+    topics_snapshot = meta["topics"] or []
+    st.session_state.topics = [t for t in topics_snapshot if t not in hidden]
+
+    if not _get_mistakes(document_name):
+        _set_mistakes(list(meta["mistakes"]), document_name)
+
+    st.session_state.agent = None
+    st.session_state.conversation = []
+    st.session_state.current_session_id = None
+    st.session_state.active_topic = None
+    st.session_state.app_state = "document_open"
+    st.session_state.session_is_pending = False
+
+
+def _close_document() -> None:
+    st.session_state.active_document = None
+    st.session_state.last_filename = None
+    st.session_state.document_text = None
+    st.session_state.topics = []
+    st.session_state.agent = None
+    st.session_state.conversation = []
+    st.session_state.current_session_id = None
+    st.session_state.active_topic = None
+    st.session_state.app_state = "no_document"
+    st.session_state.session_is_pending = False
+
+
+# ── Dialog infrastructure ─────────────────────────────────────────────────────
+
+def _close_dialog() -> None:
+    st.session_state["_pending_dialog"] = None
+    st.rerun()
+
+
+@st.dialog("Log out?")
+def _dlg_logout():
+    st.write("Bist du sicher, dass du dich abmelden möchtest?")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Cancel", use_container_width=True):
+            _close_dialog()
+    with col2:
+        if st.button("Log out", type="primary", use_container_width=True):
+            st.session_state["_pending_dialog"] = None
+            logout()
+
+
+@st.dialog("Delete document?")
+def _dlg_delete_document(name: str):
+    st.write(
+        f"Willst du **{name}** wirklich löschen? Alle Topics, Sessions "
+        "und Fehler-Reviews dieses Dokuments werden entfernt. Das kann "
+        "nicht rückgängig gemacht werden."
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Cancel", use_container_width=True):
+            _close_dialog()
+    with col2:
+        if st.button("Delete", type="primary", use_container_width=True):
+            user = st.session_state["user"]
+            history.delete_document(user["id"], name)
+            st.session_state.mistakes_by_user.get(user["id"], {}).pop(name, None)
+            _invalidate_rag(name)
+            _invalidate_doc_meta(name)
+            _invalidate_docs_cache()
+            if st.session_state.active_document == name:
+                _close_document()
+            st.session_state["_pending_dialog"] = None
+            st.rerun()
+
+
+@st.dialog("Hide topic?")
+def _dlg_hide_topic(topic: str):
+    st.write(
+        f"Willst du das Topic **{topic}** ausblenden? Die zugehörige Session "
+        "und alle dazu gespeicherten Fehler werden gelöscht. Du kannst es "
+        "später im **Hidden**-Tab wiederherstellen."
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Cancel", use_container_width=True):
+            _close_dialog()
+    with col2:
+        if st.button("Hide", type="primary", use_container_width=True):
+            user = st.session_state["user"]
+            doc = st.session_state.active_document
+            meta = _get_doc_meta(doc)
+            session = _find_session_in_meta(meta, topic)
+            if session:
+                history.delete_session(session["id"], user["id"])
+            history.hide_topic(user["id"], doc, topic)
+            if topic in st.session_state.topics:
+                st.session_state.topics.remove(topic)
+            _set_mistakes([m for m in _get_mistakes() if m.get("topic") != topic])
+            if st.session_state.active_topic == topic:
+                st.session_state.agent = None
+                st.session_state.conversation = []
+                st.session_state.current_session_id = None
+                st.session_state.active_topic = None
+                st.session_state.app_state = "document_open"
+            _invalidate_doc_meta(doc)
+            _invalidate_docs_cache()
+            st.session_state["_pending_dialog"] = None
+            st.rerun()
+
+
+@st.dialog("Delete mistake?")
+def _dlg_delete_mistake(index: int):
+    st.write("Diesen Eintrag aus der Review-Liste entfernen?")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Cancel", use_container_width=True):
+            _close_dialog()
+    with col2:
+        if st.button("Delete", type="primary", use_container_width=True):
+            mistakes = _get_mistakes()
+            if 0 <= index < len(mistakes):
+                mistakes.pop(index)
+                _set_mistakes(mistakes)
+                _persist()
+            st.session_state["_pending_dialog"] = None
+            st.rerun()
+
+
+@st.dialog("Clear review list?")
+def _dlg_clear_mistakes():
+    st.write(
+        "Willst du die komplette Review-Liste dieses Dokuments leeren? "
+        "Das kann nicht rückgängig gemacht werden."
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Cancel", use_container_width=True):
+            _close_dialog()
+    with col2:
+        if st.button("Clear all", type="primary", use_container_width=True):
+            _set_mistakes([])
+            _persist()
+            st.session_state["_pending_dialog"] = None
+            st.rerun()
+
+
+@st.dialog("Restart topic?")
+def _dlg_restart_topic(topic: str):
+    st.write(
+        f"Willst du **{topic}** komplett neu starten? Der bisherige Fortschritt "
+        "und die Konversation dieses Topics werden überschrieben."
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Cancel", use_container_width=True):
+            _close_dialog()
+    with col2:
+        if st.button("Restart", type="primary", use_container_width=True):
+            st.session_state["_pending_dialog"] = None
+            st.session_state.pending_topic = topic
+            st.rerun()
+
+
+def _dispatch_dialog() -> None:
+    """Open at most one dialog per rerun based on `_pending_dialog`."""
+    pending = st.session_state.get("_pending_dialog")
+    if not pending:
+        return
+    kind = pending.get("kind")
+    if kind == "logout":
+        _dlg_logout()
+    elif kind == "delete_document":
+        _dlg_delete_document(pending["name"])
+    elif kind == "hide_topic":
+        _dlg_hide_topic(pending["topic"])
+    elif kind == "delete_mistake":
+        _dlg_delete_mistake(pending["index"])
+    elif kind == "clear_mistakes":
+        _dlg_clear_mistakes()
+    elif kind == "restart_topic":
+        _dlg_restart_topic(pending["topic"])
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+user = st.session_state.get("user") or require_login()
+if user is None:
+    st.stop()
+st.session_state["user"] = user
+
+_dispatch_dialog()
+
+
+# ── Upload & topic start ──────────────────────────────────────────────────────
+
+def _handle_upload(uploaded_file) -> None:
+    user = st.session_state["user"]
     text = load_document(uploaded_file, uploaded_file.name)
     if len(text.strip()) < 50:
         raise ValueError("Document appears empty or could not be parsed.")
-    rag = RAGIndex(text)
-    agent = StudyBuddyAgent(text, rag)
-    topics = agent.extract_topics()
 
-    hidden = history.get_hidden_topics(user["id"], uploaded_file.name)
+    doc_name = uploaded_file.name
+
+    existing_meta = history.load_document_meta(user["id"], doc_name)
+    if existing_meta and existing_meta["topics"]:
+        topics = existing_meta["topics"]
+        _get_rag(doc_name, text)
+    else:
+        rag = _get_rag(doc_name, text)
+        agent = StudyBuddyAgent(text, rag)
+        topics = agent.extract_topics()
+
+    hidden = history.get_hidden_topics(user["id"], doc_name)
     topics = [t for t in topics if t not in hidden]
 
-    st.session_state.agent = agent
-    st.session_state.topics = topics
-    st.session_state.conversation = []
+    if not existing_meta:
+        history.create_session(
+            user["id"], doc_name, text, PENDING_TOPIC_LABEL, topics,
+            {}, [], [], None, None, 0,
+        )
+
+    _invalidate_docs_cache()
+    _invalidate_doc_meta(doc_name)
+
+    st.session_state.active_document = doc_name
+    st.session_state.last_filename = doc_name
     st.session_state.document_text = text
-    st.session_state.app_state = "topic_select"
-    st.session_state.last_filename = uploaded_file.name
-    _set_mistakes([])
-
-    st.session_state.current_session_id = history.create_session(
-        user["id"],
-        uploaded_file.name,
-        text,
-        PENDING_TOPIC_LABEL,
-        topics,
-        {},
-        [],
-        [],
-        None,
-        None,
-        0,
-    )
-    st.session_state.session_is_pending = True
-
-    return len(text), topics
+    st.session_state.topics = topics
+    st.session_state.agent = None
+    st.session_state.conversation = []
+    st.session_state.current_session_id = None
+    st.session_state.active_topic = None
+    st.session_state.app_state = "document_open"
+    st.session_state.session_is_pending = False
+    _set_mistakes([], doc_name)
 
 
-def _select_topic(topic: str):
-    agent: StudyBuddyAgent = st.session_state.agent
+def _select_topic(topic: str) -> None:
+    user = st.session_state["user"]
+    doc = st.session_state.active_document
+    if not doc:
+        return
+
+    meta = _get_doc_meta(doc)
+    existing = _find_session_in_meta(meta, topic)
+
+    if existing:
+        rag = _get_rag(doc, meta["document_text"])
+        agent = StudyBuddyAgent(meta["document_text"], rag)
+        agent.concepts = existing["concepts"]
+        agent.current_topic = existing["topic"]
+        agent.current_concept = existing["current_concept"]
+        agent.current_question = existing["current_question"]
+        agent.follow_up_count = existing["follow_up_count"]
+        agent.asked_questions = [
+            m["content"] for m in existing["conversation"] if m["type"] == "question"
+        ]
+        st.session_state.agent = agent
+        st.session_state.conversation = existing["conversation"]
+        st.session_state.current_session_id = existing["id"]
+        st.session_state.session_is_pending = False
+        st.session_state.active_topic = topic
+
+        if agent.topic_complete:
+            st.session_state.app_state = "mastered"
+        else:
+            last_type = existing["conversation"][-1]["type"] if existing["conversation"] else None
+            st.session_state.app_state = "questioning" if last_type == "question" else "feedback"
+        return
+
+    rag = _get_rag(doc, st.session_state.document_text)
+    agent = StudyBuddyAgent(st.session_state.document_text, rag)
     question = agent.start_topic(topic)
     n_concepts = len(agent.concepts)
+
     st.session_state.conversation = [
         {
             "role": "assistant",
@@ -140,91 +533,36 @@ def _select_topic(topic: str):
         },
         {"role": "assistant", "content": question, "type": "question"},
     ]
+    st.session_state.agent = agent
+    st.session_state.active_topic = topic
     st.session_state.app_state = "questioning"
 
-    if st.session_state.session_is_pending and st.session_state.current_session_id:
-        # Turn the upload's placeholder row into this topic's real session
-        # instead of creating a duplicate.
+    placeholder = _find_placeholder_in_meta(meta)
+    if placeholder:
         history.update_session(
-            st.session_state.current_session_id,
-            user["id"],
-            agent.concepts,
-            st.session_state.conversation,
-            _get_mistakes(),
-            agent.current_concept,
-            agent.current_question,
-            agent.follow_up_count,
+            placeholder["id"], user["id"],
+            agent.concepts, st.session_state.conversation, _get_mistakes(),
+            agent.current_concept, agent.current_question, agent.follow_up_count,
             topic=topic,
         )
+        st.session_state.current_session_id = placeholder["id"]
         st.session_state.session_is_pending = False
     else:
         st.session_state.current_session_id = history.create_session(
-            user["id"],
-            st.session_state.last_filename,
-            st.session_state.document_text,
-            topic,
-            st.session_state.topics,
-            agent.concepts,
-            st.session_state.conversation,
-            _get_mistakes(),
-            agent.current_concept,
-            agent.current_question,
+            user["id"], doc, st.session_state.document_text, topic,
+            st.session_state.topics, agent.concepts, st.session_state.conversation,
+            _get_mistakes(), agent.current_concept, agent.current_question,
             agent.follow_up_count,
         )
 
+    _invalidate_docs_cache()
+    _invalidate_doc_meta(doc)
 
-def _resume_session(session_id: int):
-    """Rebuild an agent + conversation from a previously saved session."""
-    saved = history.load_session(session_id, user["id"])
-    if saved is None:
-        st.error("Could not find that saved session.")
-        return
 
-    rag = RAGIndex(saved["document_text"])
-    agent = StudyBuddyAgent(saved["document_text"], rag)
-    agent.concepts = saved["concepts"]
-    agent.current_topic = saved["topic"]
-    agent.current_concept = saved["current_concept"]
-    agent.current_question = saved["current_question"]
-    agent.follow_up_count = saved["follow_up_count"]
-    agent.asked_questions = [
-        m["content"] for m in saved["conversation"] if m["type"] == "question"
-    ]
-
-    st.session_state.agent = agent
-    st.session_state.document_text = saved["document_text"]
-    st.session_state.last_filename = saved["document_name"]
-    st.session_state.current_session_id = session_id
-    st.session_state.session_is_pending = (saved["topic"] == PENDING_TOPIC_LABEL)
-
-    # Filter out anything hidden for this document — saved["topics"] is a
-    # snapshot from whenever this session was created/updated, and may still
-    # include topics that were deleted afterward.
-    hidden = history.get_hidden_topics(user["id"], saved["document_name"])
-    st.session_state.topics = [t for t in saved["topics"] if t not in hidden]
-
-    st.session_state.conversation = saved["conversation"]
-
-    # Merge this session's mistakes into THIS document's review list — dedupe by
-    # (topic, question) so re-resuming the same session doesn't duplicate entries.
-    existing = _get_mistakes()
-    existing_keys = {(m["topic"], m["question"]) for m in existing}
-    merged = existing + [
-        m for m in saved["mistakes"] if (m["topic"], m["question"]) not in existing_keys
-    ]
-    _set_mistakes(merged)
-
-    if st.session_state.session_is_pending:
-        st.session_state.app_state = "topic_select"
-    elif agent.topic_complete:
-        st.session_state.app_state = "mastered"
-    else:
-        last_type = saved["conversation"][-1]["type"] if saved["conversation"] else None
-        st.session_state.app_state = "questioning" if last_type == "question" else "feedback"
-
+# ── Renderers ─────────────────────────────────────────────────────────────────
 
 def _render_progress():
-    agent: StudyBuddyAgent = st.session_state.agent
+    agent = st.session_state.agent
     if not agent or not agent.concepts:
         return
     done, total = agent.progress
@@ -256,44 +594,97 @@ def _render_conversation():
                 st.markdown(msg["content"])
 
 
-def _render_mistakes():
+def _render_topics_tab():
+    if not st.session_state.topics:
+        st.caption("No topics available for this document.")
+        return
+
+    doc = st.session_state.active_document
+    meta = _get_doc_meta(doc) or {"sessions": []}
+
+    sessions_by_topic: dict[str, dict] = {}
+    for s in meta["sessions"]:
+        if s["topic"] == PENDING_TOPIC_LABEL:
+            continue
+        sessions_by_topic.setdefault(s["topic"], s)
+
+    for topic in st.session_state.topics:
+        col1, col2 = st.columns([6, 1])
+        with col1:
+            s = sessions_by_topic.get(topic)
+            status = ""
+            if s:
+                concepts = s["concepts"] or {}
+                if concepts and all(concepts.values()):
+                    status = "✅ mastered"
+                elif concepts:
+                    done = sum(1 for v in concepts.values() if v)
+                    status = f"🟡 {done}/{len(concepts)}"
+                else:
+                    status = "🟡 in progress"
+            label = f"**{topic}**" + (f" — {status}" if status else "")
+            if st.button(label, key=f"open_topic_{topic}", use_container_width=True):
+                st.session_state.pending_topic = topic
+                st.rerun()
+        with col2:
+            if st.button("🙈", key=f"hide_{topic}", help="Hide this topic and delete its sessions"):
+                st.session_state["_pending_dialog"] = {"kind": "hide_topic", "topic": topic}
+                st.rerun()
+
+
+def _render_review_tab():
     mistakes = _get_mistakes()
     if not mistakes:
-        st.caption("No mistakes recorded yet.")
+        st.caption("No mistakes recorded for this document yet.")
         return
-    with st.expander(f"❌ Review ({len(mistakes)})"):
-        for i, m in enumerate(mistakes, 1):
-            answer = m["answer"]
-            if len(answer) > 200:
-                answer = answer[:200].rstrip() + "…"
-            col1, col2 = st.columns([5, 1])
-            with col1:
-                st.markdown(f"**{i}. {m['question']}**")
-                st.caption(f"{m['topic']} · {m['score']}")
-                st.markdown(f"Your answer: {answer}")
-                if m["missing"]:
-                    st.markdown(f"Missing: {m['missing']}")
-            with col2:
-                if st.button("🗑️", key=f"delete_mistake_{i}"):
-                    mistakes.pop(i - 1)
-                    _set_mistakes(mistakes)
-                    _persist()
-                    st.rerun()
-            if i < len(mistakes):
-                st.divider()
-        if st.button("Clear review list", key="clear_mistakes", use_container_width=True):
-            _set_mistakes([])
-            _persist()
-            st.rerun()
+    for i, m in enumerate(mistakes, 1):
+        answer = m["answer"]
+        if len(answer) > 200:
+            answer = answer[:200].rstrip() + "…"
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            st.markdown(f"**{i}. {m['question']}**")
+            st.caption(f"{m['topic']} · {m['score']}")
+            st.markdown(f"Your answer: {answer}")
+            if m.get("missing"):
+                st.markdown(f"Missing: {m['missing']}")
+        with col2:
+            if st.button("🗑️", key=f"del_mistake_{i}"):
+                st.session_state["_pending_dialog"] = {"kind": "delete_mistake", "index": i - 1}
+                st.rerun()
+        if i < len(mistakes):
+            st.divider()
+    if st.button("Clear review list", key="clear_mistakes", use_container_width=True):
+        st.session_state["_pending_dialog"] = {"kind": "clear_mistakes"}
+        st.rerun()
 
-# ── Pending action handler ────────────────────────────────────────────────────
-# Runs BEFORE the sidebar renders, so the slow LLM call in _select_topic() never
-# happens mid-render of a widget-heavy sidebar.
+
+def _render_hidden_tab():
+    user = st.session_state["user"]
+    doc = st.session_state.active_document
+    hidden_list = history.get_hidden_topics_list(user["id"], doc)
+    if not hidden_list:
+        st.caption("No hidden topics for this document.")
+        return
+    for topic in hidden_list:
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            st.markdown(topic)
+        with col2:
+            if st.button("👁️", key=f"unhide_{topic}", help="Unhide this topic"):
+                history.unhide_topic(user["id"], doc, topic)
+                if topic not in st.session_state.topics:
+                    st.session_state.topics.append(topic)
+                _invalidate_doc_meta(doc)
+                st.rerun()
+
+
+# ── Pending topic action ──────────────────────────────────────────────────────
 
 if st.session_state.pending_topic is not None:
     topic = st.session_state.pending_topic
     st.session_state.pending_topic = None
-    with st.spinner(f"Preparing first question on **{topic}**…"):
+    with st.spinner(f"Preparing **{topic}**… (first load may take a few seconds)"):
         try:
             _select_topic(topic)
         except Exception as e:
@@ -309,15 +700,27 @@ with st.sidebar:
         st.markdown("### 📚 StudyBuddy")
         st.caption("AI Learning Partner")
     with header_col2:
-        st.caption(f"👤 {user['username']}")
+        initials = "".join(part[0].upper() for part in user["username"].split()[:2]) or user["username"][:2].upper()
+        st.markdown(
+            f"""
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+                <div style="
+                    width:32px;height:32px;border-radius:50%;
+                    background:linear-gradient(135deg,#4f46e5,#7c3aed);
+                    color:white;display:flex;align-items:center;justify-content:center;
+                    font-weight:600;font-size:13px;">
+                    {initials}
+                </div>
+                <div style="font-size:0.85rem;">
+                    <div style="font-weight:600;">{user["username"]}</div>
+                    <div style="color:#8a8a8a;font-size:0.75rem;">{user["email"]}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         if st.button("Log out", use_container_width=True):
-            logout()
-            for key in [
-                "agent", "topics", "conversation", "app_state", "last_filename",
-                "celebrate", "mistakes_by_user", "document_text", "current_session_id",
-                "pending_topic", "_uploader_had_file", "_uploader_key", "session_is_pending",
-            ]:
-                st.session_state.pop(key, None)
+            st.session_state["_pending_dialog"] = {"kind": "logout"}
             st.rerun()
 
     st.divider()
@@ -331,117 +734,41 @@ with st.sidebar:
 
     if uploaded is not None:
         st.session_state._uploader_had_file = True
-        if uploaded.name != st.session_state.last_filename:
+        if uploaded.name != st.session_state.active_document:
             with st.spinner("Processing document…"):
                 try:
-                    chars, topics = _load_file(uploaded)
-                    st.toast(f"{chars:,} characters · {len(topics)} topics found", icon="✅")
+                    _handle_upload(uploaded)
                     st.session_state._uploader_key += 1
                     st.session_state._uploader_had_file = False
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
-                    st.session_state.last_filename = None
-
     elif st.session_state._uploader_had_file:
-        # The user clicked the uploader's own "✕" to remove the file — clean up
-        # everything tied to that document: its sessions, topics, and review list.
-        removed_doc = st.session_state.last_filename
         st.session_state._uploader_had_file = False
 
-        if removed_doc:
-            for s in history.list_sessions(user["id"]):
-                if s["document_name"] == removed_doc:
-                    history.delete_session(s["id"], user["id"])
-
-        st.session_state.agent = None
-        st.session_state.topics = []
-        st.session_state.conversation = []
-        st.session_state.document_text = None
-        st.session_state.current_session_id = None
-        st.session_state.session_is_pending = False
-        st.session_state.last_filename = None
-        st.session_state.app_state = "upload"
-        st.rerun()
-
     st.divider()
 
-    tab_topics, tab_review, tab_hidden = st.tabs(["📖 Topics", "❌ Review", "🙈 Hidden"])
-
-    with tab_topics:
-        if st.session_state.topics:
-            for topic in st.session_state.topics:
-                col1, col2 = st.columns([5, 1])
-                with col1:
-                    if st.button(topic, key=f"btn_{topic}", use_container_width=True):
-                        st.session_state.pending_topic = topic
-                        st.rerun()
-                with col2:
-                    if st.button("🙈", key=f"hide_topic_{topic}", help="Hide this topic"):
-                        matching = [s for s in history.list_sessions(user["id"]) if s["topic"] == topic]
-                        for s in matching:
-                            history.delete_session(s["id"], user["id"])
-                        history.hide_topic(user["id"], st.session_state.last_filename, topic)
-                        st.session_state.topics.remove(topic)
-                        _set_mistakes([m for m in _get_mistakes() if m["topic"] != topic])
-                        if st.session_state.agent and st.session_state.agent.current_topic == topic:
-                            st.session_state.agent = None
-                            st.session_state.conversation = []
-                            st.session_state.current_session_id = None
-                            st.session_state.session_is_pending = False
-                            st.session_state.app_state = "topic_select"
-                        st.rerun()
-        else:
-            st.caption("Upload a document to see topics here.")
-
-    with tab_review:
-        _render_mistakes()
-
-    with tab_hidden:
-        if not st.session_state.last_filename:
-            st.caption("Upload a document to manage its hidden topics.")
-        else:
-            hidden_list = history.get_hidden_topics_list(user["id"], st.session_state.last_filename)
-            if not hidden_list:
-                st.caption("No hidden topics for this document.")
-            for topic in hidden_list:
-                col1, col2 = st.columns([5, 1])
-                with col1:
-                    st.markdown(topic)
-                with col2:
-                    if st.button("👁️", key=f"unhide_{topic}", help="Unhide this topic"):
-                        history.unhide_topic(user["id"], st.session_state.last_filename, topic)
-                        if topic not in st.session_state.topics:
-                            st.session_state.topics.append(topic)
-                        st.rerun()
-
-    st.markdown("#### 🕘 Sessions")
-    sessions = history.list_sessions(user["id"])
-    if not sessions:
-        st.caption("No sessions yet.")
-    for s in sessions:
-        col1, col2 = st.columns([5, 1])
+    st.markdown("#### 🕘 Meine Dokumente")
+    docs = _get_docs()
+    if not docs:
+        st.caption("Noch keine Dokumente. Lade oben eine Datei hoch.")
+    for d in docs:
+        name = d["document_name"]
+        is_active = (name == st.session_state.active_document)
+        label = ("▶ " if is_active else "📄 ") + name
+        col1, col2 = st.columns([6, 1])
         with col1:
-            label = f"{s['document_name']} · {s['topic']}"
-            if st.button(label, key=f"resume_{s['id']}", use_container_width=True):
-                _resume_session(s["id"])
-                st.rerun()
+            if st.button(label, key=f"open_doc_{name}", use_container_width=True):
+                if not is_active:
+                    _open_document(name)
+                    st.rerun()
         with col2:
-            if st.button("🗑️", key=f"delete_{s['id']}"):
-                history.delete_session(s["id"], user["id"])
-                if s["topic"] in st.session_state.topics:
-                    st.session_state.topics.remove(s["topic"])
-                if st.session_state.last_filename == s["document_name"]:
-                    _set_mistakes([m for m in _get_mistakes() if m["topic"] != s["topic"]])
-                if st.session_state.current_session_id == s["id"]:
-                    st.session_state.agent = None
-                    st.session_state.conversation = []
-                    st.session_state.current_session_id = None
-                    st.session_state.session_is_pending = False
-                    st.session_state.app_state = "topic_select"
+            if st.button("🗑️", key=f"del_doc_{name}", help="Dieses Dokument und alle zugehörigen Sessions löschen"):
+                st.session_state["_pending_dialog"] = {"kind": "delete_document", "name": name}
                 st.rerun()
 
     st.divider()
+    render_stay_signed_in_help()
     st.caption(f"Model: {os.getenv('MODEL', 'not configured')}")
 
 
@@ -449,24 +776,46 @@ with st.sidebar:
 
 st.title("StudyBuddy — AI Learning Partner")
 
+if st.session_state.active_document and st.session_state.app_state == "no_document":
+    _open_document(st.session_state.active_document)
+
 state = st.session_state.app_state
 
-if state == "upload":
-    st.info("Upload a PDF, TXT, or DOCX file in the sidebar to get started.")
+if state == "no_document":
+    st.info("Wähle links ein Dokument aus oder lade eine neue Datei hoch.")
     st.markdown("""
 **How it works:**
 
-1. Upload your lecture notes or slides (PDF, Word, or plain text)
-2. StudyBuddy extracts the main topics automatically
-3. Select a topic — StudyBuddy identifies its key concepts and asks you a question **from the material only**
-4. Explain the concept in your own words
-5. Get instant feedback and targeted follow-up questions until **every key concept** of the topic is mastered
+1. Upload your lecture notes or slides (PDF, Word, or plain text) — jedes Dokument ist ein eigener Chat.
+2. StudyBuddy extracts the main topics automatically.
+3. Inside a document, click a topic in the **Topics** tab.
+4. Explain the concept in your own words — StudyBuddy evaluates it and asks targeted follow-ups until **every key concept** is mastered.
+5. Use the **Review** tab for mistakes specific to this document, and **Hidden** to restore hidden topics.
 """)
 
-elif state == "topic_select":
-    st.info("Please choose a topic from the **Topics** tab in the sidebar to start a session.")
+elif state == "document_open":
+    st.subheader(f"📄 {st.session_state.active_document}")
+    tab_topics, tab_review, tab_hidden = st.tabs(["📖 Topics", "❌ Review", "🙈 Hidden"])
+    with tab_topics:
+        _render_topics_tab()
+    with tab_review:
+        _render_review_tab()
+    with tab_hidden:
+        _render_hidden_tab()
 
 elif state in ("questioning", "feedback", "mastered"):
+    top_col1, top_col2 = st.columns([1, 5])
+    with top_col1:
+        if st.button("← Topics", use_container_width=True):
+            st.session_state.agent = None
+            st.session_state.conversation = []
+            st.session_state.current_session_id = None
+            st.session_state.active_topic = None
+            st.session_state.app_state = "document_open"
+            st.rerun()
+    with top_col2:
+        st.markdown(f"### 💬 {st.session_state.active_topic}")
+
     _render_progress()
     _render_conversation()
 
@@ -488,71 +837,55 @@ elif state in ("questioning", "feedback", "mastered"):
                     st.error(f"The AI service did not respond ({e}). Please submit your answer again.")
                     st.stop()
 
-            agent: StudyBuddyAgent = st.session_state.agent
+            agent = st.session_state.agent
             score = result.get("score", "partial")
             feedback = result.get("feedback", "")
             follow_up = result.get("follow_up")
 
             if score in ("partial", "incorrect"):
                 current = _get_mistakes()
-                current.append(
-                    {
-                        "topic": agent.current_topic,
-                        "question": asked_question,
-                        "answer": answer,
-                        "missing": result.get("missing"),
-                        "score": score,
-                    }
-                )
+                current.append({
+                    "topic": agent.current_topic,
+                    "question": asked_question,
+                    "answer": answer,
+                    "missing": result.get("missing"),
+                    "score": score,
+                })
                 _set_mistakes(current)
 
             if agent.topic_complete:
-                st.session_state.conversation.append(
-                    {
-                        "role": "assistant",
-                        "content": f"Correct! {feedback}" if score == "correct" else feedback,
-                        "type": "feedback",
-                        "score": score,
-                    }
-                )
-                st.session_state.conversation.append(
-                    {
-                        "role": "assistant",
-                        "content": f"🎉 You've explained all key concepts of **{agent.current_topic}** — topic mastered!",
-                        "type": "mastered",
-                    }
-                )
+                st.session_state.conversation.append({
+                    "role": "assistant",
+                    "content": f"Correct! {feedback}" if score == "correct" else feedback,
+                    "type": "feedback", "score": score,
+                })
+                st.session_state.conversation.append({
+                    "role": "assistant",
+                    "content": f"🎉 You've explained all key concepts of **{agent.current_topic}** — topic mastered!",
+                    "type": "mastered",
+                })
                 st.session_state.celebrate = True
                 st.session_state.app_state = "mastered"
-
             elif score == "correct":
-                st.session_state.conversation.append(
-                    {
-                        "role": "assistant",
-                        "content": f"Correct! {feedback}",
-                        "type": "feedback",
-                        "score": "correct",
-                    }
-                )
+                st.session_state.conversation.append({
+                    "role": "assistant",
+                    "content": f"Correct! {feedback}",
+                    "type": "feedback", "score": "correct",
+                })
                 st.session_state.app_state = "feedback"
-
             elif follow_up:
-                st.session_state.conversation.append(
-                    {"role": "assistant", "content": feedback, "type": "feedback", "score": score}
-                )
-                st.session_state.conversation.append(
-                    {"role": "assistant", "content": follow_up, "type": "question"}
-                )
-
+                st.session_state.conversation.append({
+                    "role": "assistant", "content": feedback, "type": "feedback", "score": score,
+                })
+                st.session_state.conversation.append({
+                    "role": "assistant", "content": follow_up, "type": "question",
+                })
             else:
-                st.session_state.conversation.append(
-                    {
-                        "role": "assistant",
-                        "content": f"{feedback} Let's approach this from another angle.",
-                        "type": "feedback",
-                        "score": score,
-                    }
-                )
+                st.session_state.conversation.append({
+                    "role": "assistant",
+                    "content": f"{feedback} Let's approach this from another angle.",
+                    "type": "feedback", "score": score,
+                })
                 st.session_state.app_state = "feedback"
 
             _persist()
@@ -568,22 +901,25 @@ elif state in ("questioning", "feedback", "mastered"):
                     except Exception as e:
                         st.error(f"The AI service did not respond ({e}). Please try again.")
                         st.stop()
-                st.session_state.conversation.append(
-                    {"role": "assistant", "content": q, "type": "question"}
-                )
+                st.session_state.conversation.append({
+                    "role": "assistant", "content": q, "type": "question",
+                })
                 st.session_state.app_state = "questioning"
                 _persist()
                 st.rerun()
         with col2:
-            if st.button("Change Topic", use_container_width=True):
+            if st.button("← Topics", use_container_width=True):
+                st.session_state.agent = None
                 st.session_state.conversation = []
-                st.session_state.app_state = "topic_select"
+                st.session_state.current_session_id = None
+                st.session_state.active_topic = None
+                st.session_state.app_state = "document_open"
                 st.rerun()
         with col3:
             if st.button("Restart Topic", use_container_width=True):
-                topic = st.session_state.agent.current_topic
+                topic = st.session_state.agent.current_topic if st.session_state.agent else None
                 if topic:
-                    st.session_state.pending_topic = topic
+                    st.session_state["_pending_dialog"] = {"kind": "restart_topic", "topic": topic}
                     st.rerun()
 
     elif state == "mastered":
@@ -592,13 +928,16 @@ elif state in ("questioning", "feedback", "mastered"):
             st.session_state.celebrate = False
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("Choose Next Topic →", type="primary", use_container_width=True):
+            if st.button("← Zurück zu Topics", type="primary", use_container_width=True):
+                st.session_state.agent = None
                 st.session_state.conversation = []
-                st.session_state.app_state = "topic_select"
+                st.session_state.current_session_id = None
+                st.session_state.active_topic = None
+                st.session_state.app_state = "document_open"
                 st.rerun()
         with col2:
             if st.button("Restart This Topic", use_container_width=True):
-                topic = st.session_state.agent.current_topic
+                topic = st.session_state.agent.current_topic if st.session_state.agent else None
                 if topic:
-                    st.session_state.pending_topic = topic
+                    st.session_state["_pending_dialog"] = {"kind": "restart_topic", "topic": topic}
                     st.rerun()

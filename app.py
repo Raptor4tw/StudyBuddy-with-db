@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -22,6 +23,7 @@ except Exception:
 
 MODEL_OPTIONS = load_model_options()
 CONTEXT_WARN_SHARE = float(os.getenv("CONTEXT_WARN_SHARE", "0.4"))
+USAGE_BLOCK_HOURS = float(os.getenv("USAGE_BLOCK_HOURS", "5"))
 
 st.set_page_config(page_title="StudyBuddy", page_icon="📚", layout="wide")
 
@@ -134,6 +136,11 @@ def _usage_cached(user_id: int, session_id: int) -> dict:
     return history.usage_by_model(user_id, session_id)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _block_usage_cached(user_id: int) -> dict:
+    return history.usage_in_current_block(user_id, USAGE_BLOCK_HOURS)
+
+
 @st.cache_resource(show_spinner=False)
 def _build_rag_cached(user_id: int, doc_name: str, document_text: str) -> RAGIndex:
     return RAGIndex(document_text)
@@ -221,6 +228,7 @@ def _save_usage():
         )
         st.session_state.usage_saved = len(agent.usage)
         _usage_cached.clear()
+        _block_usage_cached.clear()
     except Exception:
         pass
 
@@ -678,6 +686,37 @@ def _context_share(model: str, prompt_tokens: int) -> float | None:
     return prompt_tokens / limit if limit else None
 
 
+def _render_block_usage():
+    """Sidebar: tokens used in the current usage block and when it resets."""
+    user = st.session_state["user"]
+    hours = f"{USAGE_BLOCK_HOURS:g}"
+    st.markdown(f"**⏱️ {hours}-Stunden-Block**")
+    try:
+        block = _block_usage_cached(user["id"])
+    except Exception as e:
+        print(f"[usage block] {type(e).__name__}: {e}")  # server log
+        st.caption("Die Nutzung konnte gerade nicht geladen werden.")
+        return
+    if block["start"] is None:
+        st.caption(f"Kein aktiver Block. Der nächste startet mit deiner nächsten Anfrage und läuft {hours} Stunden.")
+        return
+    per_model = block["per_model"]
+    # Relative times only: the DB clock may not be in the viewer's time zone
+    length = block["resets_at"] - block["start"]
+    left = max(block["resets_at"] - block["now"], timedelta(0))
+    minutes_left = int(left.total_seconds() // 60)
+    st.progress(
+        min(1.0, 1 - left / length),
+        text=f"Erneuert in {minutes_left // 60} h {minutes_left % 60} min",
+    )
+    col_in, col_out = st.columns(2)
+    col_in.metric("Input", f"{sum(p for p, _ in per_model.values()):,}")
+    col_out.metric("Output", f"{sum(c for _, c in per_model.values()):,}")
+    if len(per_model) > 1:
+        for name, (tin, tout) in per_model.items():
+            st.caption(f"🤖 {name}: {tin:,} in · {tout:,} out")
+
+
 def _render_usage():
     user = st.session_state["user"]
     agent: StudyBuddyAgent = st.session_state.agent
@@ -971,23 +1010,34 @@ with st.sidebar:
     docs = _get_docs()
     if not docs:
         st.caption("Noch keine Dokumente. Lade oben eine Datei hoch.")
-    for idx, d in enumerate(docs):
-        name = d["document_name"]
-        is_active = (name == st.session_state.active_document)
-        label = ("▶ " if is_active else "📄 ") + name
+    else:
+        names = [d["document_name"] for d in docs]
+        active = st.session_state.active_document
         with st.container(horizontal=True, horizontal_alignment="distribute",
                           vertical_alignment="center"):
-            if st.button(label, key=f"open_doc_{idx}", use_container_width=True):
-                if not is_active:
-                    _open_document(name)
-                    st.rerun()
-            if st.button("🗑️", key=f"del_doc_{idx}", help="Dieses Dokument und alle zugehörigen Sessions löschen"):
-                st.session_state["_pending_dialog"] = {"kind": "delete_document", "name": name}
+            # The key includes the open document, so the widget is rebuilt with
+            # the right value whenever a document is opened, uploaded or deleted.
+            choice = st.selectbox(
+                "Dokument",
+                names,
+                index=names.index(active) if active in names else None,
+                format_func=lambda n: f"📄 {n}",
+                placeholder="Dokument wählen…",
+                label_visibility="collapsed",
+                key=f"doc_select_{active}",
+            )
+            if st.button("🗑️", key="del_active_doc", disabled=active not in names,
+                         help="Dieses Dokument und alle zugehörigen Sessions löschen"):
+                st.session_state["_pending_dialog"] = {"kind": "delete_document", "name": active}
                 st.rerun()
+        if choice and choice != active:
+            _open_document(choice)
+            st.rerun()
 
     st.divider()
     render_stay_signed_in_help()
     st.caption(f"Model: {st.session_state.model or os.getenv('MODEL', 'not configured')}")
+    _render_block_usage()
     with st.expander("📊 Token usage"):
         _render_usage()
 

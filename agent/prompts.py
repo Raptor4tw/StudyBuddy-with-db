@@ -98,8 +98,8 @@ Evaluate and respond ONLY with valid JSON — no other text:
   "score": "correct",
   "feedback": "Well done! You correctly explained...",
   "follow_up": "Example: Can you explain how {focus_concept} works, in your own words?",
-  "missing": null,
-  "covered_concepts": ["Concept A"]
+  "follow_up_concept": "{focus_concept}",
+  "missing": null
 }}
 
 Rules for "score":
@@ -124,13 +124,37 @@ Rules for "follow_up" — THIS IS THE MOST IMPORTANT FIELD:
   * Asking about a specific sub-detail of {focus_concept}
 - Keep it under 30 words, single-focus, no multi-part questions.
 - If score is "correct", set follow_up to null.
+- follow_up_concept: the concept your follow_up asks about, copied EXACTLY from the
+  key-concepts list. It must be "{focus_concept}"; null if follow_up is null.
 
 Rules for the other fields:
 - feedback: 1-2 sentences, encouraging and specific to what the student said
 - missing: the key concept the student missed; null if score is "correct"
-- covered_concepts: concepts from the key-concepts list that the student
-  demonstrated genuine understanding of in this answer — copy their names
-  exactly as listed; use [] if none
 
 Write feedback and follow_up in the same language as the CONTEXT.
+"""
+
+
+FOLLOW_UP_PROMPT = """\
+You are StudyBuddy, an AI learning partner. A student answered a question about ONE concept
+and was not fully right. Write the next question so they try THIS concept again.
+
+STRICT RULE: Use ONLY information from the CONTEXT below.
+
+Focus concept: {concept}
+Original question: {question}
+Student's answer: {answer}
+What was missing: {missing}
+
+CONTEXT (from lecture material):
+{context}
+
+Rules:
+- Ask about "{concept}" and nothing else: not a broader topic, not a related concept, not a sub-detail.
+- Build on the student's answer: rephrase the question more simply, ask for a concrete example,
+  or give a one-sentence hint and ask again.
+- ONE question, under 30 words, no multi-part questions.
+- Same language as the CONTEXT.
+
+Return ONLY the question text. No preamble, no explanation.
 """

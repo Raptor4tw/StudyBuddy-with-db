@@ -11,6 +11,7 @@ from openai import OpenAI
 from agent.prompts import (
     CONCEPT_EXTRACTION_PROMPT,
     EVALUATION_PROMPT,
+    FOLLOW_UP_PROMPT,
     QUESTION_GENERATION_PROMPT,
     TOPIC_EXTRACTION_PROMPT,
 )
@@ -82,14 +83,6 @@ def _sample_text(text: str, total_chars: int | None = None, sections: int = 3) -
     return "\n\n[...]\n\n".join(
         text[i * stride : i * stride + piece] for i in range(sections)
     )
-
-
-def _mark_covered(concepts: dict, names: list) -> None:
-    by_norm = {c.strip().lower(): c for c in concepts}
-    for name in names:
-        key = by_norm.get(str(name).strip().lower())
-        if key:
-            concepts[key] = True
 
 
 def _is_broken_topic(s: str) -> bool:
@@ -178,6 +171,8 @@ class StudyBuddyAgent:
         self.asked_questions: list[str] = []
         self.follow_up_count: int = 0
         self.max_follow_ups: int = 999  # effectively unlimited; the user skips manually
+        # Concepts the student skipped; asked again once the others are done
+        self.skipped: list[str] = []
         self.usage: list[dict] = []
 
     def _complete(self, messages: list, model: str | None = None) -> str:
@@ -288,8 +283,14 @@ class StudyBuddyAgent:
         return bool(self.concepts) and all(self.concepts.values())
 
     def _next_uncovered(self) -> str | None:
-        for concept, covered in self.concepts.items():
-            if not covered:
+        uncovered = [c for c, covered in self.concepts.items() if not covered]
+        for concept in uncovered:
+            if concept not in self.skipped:
+                return concept
+        # Only skipped concepts are left: come back to the oldest one
+        for concept in self.skipped:
+            if concept in uncovered:
+                self.skipped.remove(concept)
                 return concept
         return None
 
@@ -297,6 +298,7 @@ class StudyBuddyAgent:
         self.current_topic = topic
         self.follow_up_count = 0
         self.asked_questions = []
+        self.skipped = []
         context = self.rag.retrieve(topic, k=4)
         self.concepts = {c: False for c in self._extract_concepts(topic, context)}
         return self._generate_question()
@@ -336,65 +338,15 @@ class StudyBuddyAgent:
                 "feedback": _strip_thinking(raw)[:300] or "Please try again with more detail.",
                 "follow_up": None,
                 "missing": None,
-                "covered_concepts": [],
             }
-
-        # ── Hard enforcement ─────────────────────────────────────────────────
-        # On partial/incorrect, the follow-up MUST re-ask the SAME focus concept.
-        # The model sometimes drifts UP (to a broader topic) or DOWN (to a
-        # sub-detail). We reject both and generate our own focused question
-        # — but it must stay specific, so we rephrase the ORIGINAL question
-        # rather than dropping to a generic "explain the concept".
-        if parsed.get("score") in ("partial", "incorrect"):
-            follow_up = (parsed.get("follow_up") or "").strip()
-            focus_clean = (self.current_concept or self.current_topic or "").strip()
-
-            if focus_clean:
-                focus_tokens = [
-                    w.lower() for w in re.findall(r"\w+", focus_clean) if len(w) > 2
-                ]
-                follow_up_lower = follow_up.lower()
-
-                matched = sum(1 for w in focus_tokens if w in follow_up_lower)
-                needed = max(1, len(focus_tokens) // 2 + 1)
-
-                other_tokens = [
-                    w for w in re.findall(r"\w+", follow_up_lower)
-                    if len(w) > 3
-                       and w not in focus_tokens
-                       and w not in {
-                           "kannst", "kann", "erklären", "erkläre", "beschreiben",
-                           "beschreibe", "eigenen", "worten", "wofür", "braucht",
-                           "genau", "bedeutet", "dieses", "diese", "dieser",
-                           "example", "concept", "explain", "describe", "means",
-                           "meaning", "used", "einfach", "einfachen", "kurz",
-                           "nochmal", "einmal", "versuchen", "versuche",
-                       }
-                ]
-                drift_up = len(other_tokens) >= 3
-
-                if not follow_up or matched < needed or drift_up:
-                    # Replace BOTH follow_up and feedback so the reply stays
-                    # coherent — a feedback that mentions "Primärschlüssel" while
-                    # the follow-up asks about "Fremdschlüssel" is confusing.
-                    base_q = question.strip().rstrip("?").rstrip(".")
-                    parsed["follow_up"] = (
-                        f"Versuche es noch einmal: {base_q}? "
-                        f"Wenn du unsicher bist, beschreibe zumindest, was "
-                        f"'{focus_clean}' deiner Meinung nach bedeutet."
-                    )
-                    parsed["feedback"] = (
-                        f"Das war noch nicht ganz richtig. Wir bleiben beim "
-                        f"Thema '{focus_clean}' — versuch es noch einmal, "
-                        f"auch mit einer kurzen, eigenen Formulierung."
-                    )
 
         return parsed
 
     def evaluate_answer(self, student_answer: str) -> dict:
         parsed = self._evaluate(self.current_question, student_answer)
 
-        _mark_covered(self.concepts, parsed.get("covered_concepts") or [])
+        # One correct answer masters one concept: the one the question was about.
+        # Concepts the answer merely touches on are still asked about later.
         if parsed.get("score") == "correct" and self.current_concept in self.concepts:
             self.concepts[self.current_concept] = True
 
@@ -404,6 +356,16 @@ class StudyBuddyAgent:
 
         # Every wrong/partial answer gets a follow-up until the concept is correct.
         # There is no upper limit — the user can skip manually if they want.
+        # The follow-up must stay on the focus concept. The evaluator names the
+        # concept its follow-up targets; if that is not the focus concept, or
+        # there is no follow-up, a narrow prompt that only knows the focus
+        # concept writes one instead.
+        if parsed.get("score") in ("partial", "incorrect") and not self.topic_complete:
+            follow_up = (parsed.get("follow_up") or "").strip()
+            if not follow_up or not self._is_focus(parsed.get("follow_up_concept")):
+                follow_up = self._focused_follow_up(student_answer, parsed.get("missing"))
+            parsed["follow_up"] = follow_up
+
         if parsed.get("follow_up") and parsed.get("score") in ("partial", "incorrect"):
             self.follow_up_count += 1
             self.current_question = parsed["follow_up"]
@@ -411,11 +373,41 @@ class StudyBuddyAgent:
 
         return parsed
 
+    def _is_focus(self, concept) -> bool:
+        focus = self.current_concept or self.current_topic or ""
+        return str(concept or "").strip().lower() == focus.strip().lower()
+
+    def _focused_follow_up(self, student_answer: str, missing) -> str:
+        """Write a follow-up about the focus concept only. Falls back to asking
+        the same question again, which is already in the material's language."""
+        concept = self.current_concept or self.current_topic or "the material"
+        context = self.rag.retrieve(f"{self.current_topic} {concept}", k=4)
+        prompt = FOLLOW_UP_PROMPT.format(
+            concept=concept,
+            question=self.current_question,
+            answer=student_answer,
+            missing=missing or "(not stated)",
+            context=context,
+        )
+        try:
+            follow_up = _strip_thinking(self._complete([{"role": "user", "content": prompt}]))
+        except Exception:
+            follow_up = ""
+        return follow_up or self.current_question
+
     def second_opinion(self, question: str, student_answer: str, model: str) -> dict:
         """Re-judge an earlier answer with another model. Display only."""
         return self._evaluate(question, student_answer, model)
 
     def next_question(self) -> str:
+        self.follow_up_count = 0
+        return self._generate_question()
+
+    def skip_question(self) -> str:
+        """Move on without counting the current concept as mastered. It is
+        asked again after the remaining concepts, so the topic stays open."""
+        if self.current_concept in self.concepts and self.current_concept not in self.skipped:
+            self.skipped.append(self.current_concept)
         self.follow_up_count = 0
         return self._generate_question()
 

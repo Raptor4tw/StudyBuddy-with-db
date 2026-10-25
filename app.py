@@ -1051,6 +1051,7 @@ elif state in ("questioning", "feedback", "mastered"):
                 st.markdown(answer)
 
             asked_question = st.session_state.agent.current_question
+            asked_concept = st.session_state.agent.current_concept
             with st.spinner("Evaluating your answer…"):
                 try:
                     result = st.session_state.agent.evaluate_answer(answer)
@@ -1070,6 +1071,7 @@ elif state in ("questioning", "feedback", "mastered"):
                 current.append({
                     "topic": agent.current_topic,
                     "question": asked_question,
+                    "concept": asked_concept,
                     "answer": answer,
                     "missing": result.get("missing"),
                     "score": score,
@@ -1077,12 +1079,16 @@ elif state in ("questioning", "feedback", "mastered"):
                 })
                 _set_mistakes(current)
             elif score == "correct":
+                # A correct answer usually comes on a follow-up whose wording
+                # differs from the listed question, so match on the concept.
+                # Entries saved before "concept" existed fall back to the question.
+                mastered = {c for c, ok in agent.concepts.items() if ok}
                 current = _get_mistakes()
                 filtered = [
                     m for m in current
                     if not (
                         m.get("topic") == agent.current_topic
-                        and m.get("question") == asked_question
+                        and (m.get("concept") in mastered or m.get("question") == asked_question)
                     )
                 ]
                 if len(filtered) != len(current):
@@ -1140,6 +1146,7 @@ elif state in ("questioning", "feedback", "mastered"):
             current.append({
                 "topic": agent.current_topic,
                 "question": agent.current_question,
+                "concept": skipped_concept,
                 "answer": "(übersprungen)",
                 "missing": skipped_concept,
                 "score": "incorrect",
@@ -1147,12 +1154,9 @@ elif state in ("questioning", "feedback", "mastered"):
             })
             _set_mistakes(current)
 
-            if skipped_concept and skipped_concept in agent.concepts:
-                agent.concepts[skipped_concept] = True
-
             with st.spinner("Generating next question…"):
                 try:
-                    q = agent.next_question()
+                    q = agent.skip_question()
                 except Exception as e:
                     st.error(f"The AI service did not respond ({e}). Please try again.")
                     st.stop()

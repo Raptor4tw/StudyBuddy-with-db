@@ -52,11 +52,32 @@ def _parse_json(text: str):
     return None
 
 
-def _sample_text(text: str, total_chars: int = 4800, sections: int = 3) -> str:
-    """Sample evenly spaced sections so long documents are represented beyond their start."""
+def _sample_text(text: str, total_chars: int | None = None, sections: int = 3) -> str:
+    """Sample evenly spaced sections so long documents are fully represented.
+
+    The sample budget scales with the document: a 5-page note uses the whole
+    text, a 100-page script uses up to 15,000 chars spread across more sections.
+    """
+    if total_chars is None:
+        if len(text) <= 6000:
+            total_chars = len(text)
+            sections = 1
+        elif len(text) <= 20000:
+            total_chars = 8000
+            sections = 3
+        elif len(text) <= 60000:
+            total_chars = 12000
+            sections = 5
+        else:
+            total_chars = 15000
+            sections = 7
+
     if len(text) <= total_chars:
         return text
+
     piece = total_chars // sections
+    if sections == 1:
+        return text[:total_chars]
     stride = (len(text) - piece) // (sections - 1)
     return "\n\n[...]\n\n".join(
         text[i * stride : i * stride + piece] for i in range(sections)
@@ -81,13 +102,10 @@ def _is_broken_topic(s: str) -> bool:
         return True
     if low in {"topics", "topic", "json", "true", "false", "null"}:
         return True
-    # Drop JSON-ish leftovers
     if any(ch in s for ch in "{}[]"):
         return True
-    # Drop names that start with a quote or colon (broken JSON fragment)
     if s[0] in "\"':" or s[-1] in "\"':":
         return True
-    # Length sanity
     if len(s) < 3 or len(s) > 80:
         return True
     return False
@@ -98,7 +116,6 @@ def _clean_topics(items) -> list[str]:
     if not items:
         return []
     if isinstance(items, dict):
-        # If the model returned {topics: [...]}, unwrap it.
         items = items.get("topics") or []
     cleaned: list[str] = []
     for t in items:
@@ -108,6 +125,41 @@ def _clean_topics(items) -> list[str]:
         if s not in cleaned:
             cleaned.append(s)
     return cleaned
+
+
+def _sanitize_concepts(concepts: list[str]) -> list[str]:
+    """Clean up concepts that the model returned as combined lists.
+
+    The model sometimes returns things like "Knoten, Beziehungen und Eigenschaften"
+    instead of three separate concepts. We split those and drop too-generic ones.
+    """
+    result: list[str] = []
+    for c in concepts:
+        c = c.strip()
+        if not c:
+            continue
+        # Split on " und ", ", ", " / ", " & " — but only if the result
+        # has at least 2 parts with >= 3 chars each
+        parts: list[str] = [c]
+        for sep in [" und ", ", ", " / ", " & ", "; "]:
+            new_parts = []
+            for p in parts:
+                new_parts.extend(p.split(sep))
+            parts = [p.strip() for p in new_parts if p.strip()]
+        # If we got multiple parts, keep them as separate concepts
+        if len(parts) > 1 and all(len(p) >= 3 for p in parts):
+            for p in parts:
+                if p not in result and len(p) <= 80:
+                    result.append(p)
+            continue
+        # Too long, too short, or too generic → reject
+        if len(c) < 4 or len(c) > 80:
+            continue
+        if c.lower() in {"cypher", "neo4j", "datenbank", "sql", "python", "c++", "java"}:
+            continue
+        if c not in result:
+            result.append(c)
+    return result or concepts
 
 
 class StudyBuddyAgent:
@@ -125,9 +177,7 @@ class StudyBuddyAgent:
         self.concepts: dict[str, bool] = {}
         self.asked_questions: list[str] = []
         self.follow_up_count: int = 0
-        self.max_follow_ups: int = 2
-        # One entry per LLM call: {"model", "prompt_tokens", "completion_tokens"}.
-        # Kept in memory only; the app decides whether to persist it.
+        self.max_follow_ups: int = 999  # effectively unlimited; the user skips manually
         self.usage: list[dict] = []
 
     def _complete(self, messages: list, model: str | None = None) -> str:
@@ -167,7 +217,6 @@ class StudyBuddyAgent:
         )
         parsed = _parse_json(raw)
 
-        # New response shape: {is_lecture_material, topics}
         if isinstance(parsed, dict) and "is_lecture_material" in parsed:
             if not parsed["is_lecture_material"]:
                 raise ValueError(
@@ -176,13 +225,12 @@ class StudyBuddyAgent:
                     "gedacht — bitte lade ein entsprechendes Dokument hoch."
                 )
             topics = _clean_topics(parsed.get("topics") or [])
-            return topics[:8] if topics else ["Main Content"]
+            return topics[:20] if topics else ["Main Content"]
 
-        # If we got a list, clean it.
         if isinstance(parsed, list):
             topics = _clean_topics(parsed)
             if topics:
-                return topics[:8]
+                return topics[:20]
 
         # Parsing failed. Retry once with a stricter prompt.
         retry_prompt = (
@@ -201,11 +249,11 @@ class StudyBuddyAgent:
                 )
             topics = _clean_topics(parsed2.get("topics") or [])
             if topics:
-                return topics[:8]
+                return topics[:20]
         if isinstance(parsed2, list):
             topics = _clean_topics(parsed2)
             if topics:
-                return topics[:8]
+                return topics[:20]
 
         # Last resort: line-based extraction, then clean.
         for candidate in (raw2, raw):
@@ -216,9 +264,8 @@ class StudyBuddyAgent:
             ]
             topics = _clean_topics(lines)
             if topics:
-                return topics[:8]
+                return topics[:20]
 
-        # Nothing usable at all — do not block, just use a placeholder.
         return ["Main Content"]
 
     def _extract_concepts(self, topic: str, context: str) -> list[str]:
@@ -227,9 +274,9 @@ class StudyBuddyAgent:
         )
         parsed = _parse_json(raw)
         if isinstance(parsed, list):
-            concepts = [str(c).strip() for c in parsed if str(c).strip()][:5]
+            concepts = [str(c).strip() for c in parsed if str(c).strip()][:8]
             if concepts:
-                return concepts
+                return _sanitize_concepts(concepts)[:5]
         return [topic]
 
     @property
@@ -272,9 +319,11 @@ class StudyBuddyAgent:
     def _evaluate(self, question: str, student_answer: str, model: str | None = None) -> dict:
         """Judge an answer without touching the learning state."""
         context = self.rag.retrieve(f"{question} {student_answer}", k=5)
+        focus = self.current_concept or self.current_topic or "the material"
         prompt = EVALUATION_PROMPT.format(
             context=context,
             concepts="\n".join(f"- {c}" for c in self.concepts),
+            focus_concept=focus,
             question=question,
             answer=student_answer,
         )
@@ -285,10 +334,61 @@ class StudyBuddyAgent:
             parsed = {
                 "score": "partial",
                 "feedback": _strip_thinking(raw)[:300] or "Please try again with more detail.",
-                "follow_up": "Can you elaborate on that?",
+                "follow_up": None,
                 "missing": None,
                 "covered_concepts": [],
             }
+
+        # ── Hard enforcement ─────────────────────────────────────────────────
+        # On partial/incorrect, the follow-up MUST re-ask the SAME focus concept.
+        # The model sometimes drifts UP (to a broader topic) or DOWN (to a
+        # sub-detail). We reject both and generate our own focused question
+        # — but it must stay specific, so we rephrase the ORIGINAL question
+        # rather than dropping to a generic "explain the concept".
+        if parsed.get("score") in ("partial", "incorrect"):
+            follow_up = (parsed.get("follow_up") or "").strip()
+            focus_clean = (self.current_concept or self.current_topic or "").strip()
+
+            if focus_clean:
+                focus_tokens = [
+                    w.lower() for w in re.findall(r"\w+", focus_clean) if len(w) > 2
+                ]
+                follow_up_lower = follow_up.lower()
+
+                matched = sum(1 for w in focus_tokens if w in follow_up_lower)
+                needed = max(1, len(focus_tokens) // 2 + 1)
+
+                other_tokens = [
+                    w for w in re.findall(r"\w+", follow_up_lower)
+                    if len(w) > 3
+                       and w not in focus_tokens
+                       and w not in {
+                           "kannst", "kann", "erklären", "erkläre", "beschreiben",
+                           "beschreibe", "eigenen", "worten", "wofür", "braucht",
+                           "genau", "bedeutet", "dieses", "diese", "dieser",
+                           "example", "concept", "explain", "describe", "means",
+                           "meaning", "used", "einfach", "einfachen", "kurz",
+                           "nochmal", "einmal", "versuchen", "versuche",
+                       }
+                ]
+                drift_up = len(other_tokens) >= 3
+
+                if not follow_up or matched < needed or drift_up:
+                    # Replace BOTH follow_up and feedback so the reply stays
+                    # coherent — a feedback that mentions "Primärschlüssel" while
+                    # the follow-up asks about "Fremdschlüssel" is confusing.
+                    base_q = question.strip().rstrip("?").rstrip(".")
+                    parsed["follow_up"] = (
+                        f"Versuche es noch einmal: {base_q}? "
+                        f"Wenn du unsicher bist, beschreibe zumindest, was "
+                        f"'{focus_clean}' deiner Meinung nach bedeutet."
+                    )
+                    parsed["feedback"] = (
+                        f"Das war noch nicht ganz richtig. Wir bleiben beim "
+                        f"Thema '{focus_clean}' — versuch es noch einmal, "
+                        f"auch mit einer kurzen, eigenen Formulierung."
+                    )
+
         return parsed
 
     def evaluate_answer(self, student_answer: str) -> dict:
@@ -298,9 +398,12 @@ class StudyBuddyAgent:
         if parsed.get("score") == "correct" and self.current_concept in self.concepts:
             self.concepts[self.current_concept] = True
 
-        if self.topic_complete or self.follow_up_count >= self.max_follow_ups:
+        # No follow-ups needed once the whole topic is mastered
+        if self.topic_complete:
             parsed["follow_up"] = None
 
+        # Every wrong/partial answer gets a follow-up until the concept is correct.
+        # There is no upper limit — the user can skip manually if they want.
         if parsed.get("follow_up") and parsed.get("score") in ("partial", "incorrect"):
             self.follow_up_count += 1
             self.current_question = parsed["follow_up"]

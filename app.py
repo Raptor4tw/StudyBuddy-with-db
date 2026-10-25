@@ -27,12 +27,9 @@ st.set_page_config(page_title="StudyBuddy", page_icon="📚", layout="wide")
 
 st.markdown("""
 <style>
-    /* Keep sidebar wide enough that buttons/icons never get clipped */
     section[data-testid="stSidebar"] {
         min-width: 300px !important;
     }
-
-    /* Left-aligned sidebar buttons */
     section[data-testid="stSidebar"] button {
         text-align: left;
         justify-content: flex-start;
@@ -43,13 +40,9 @@ st.markdown("""
         overflow: hidden;
         text-overflow: ellipsis;
     }
-
-    /* Chat bubbles */
     div[data-testid="stChatMessage"] {
         border-radius: 10px;
     }
-
-    /* User badge: name truncates with ellipsis instead of wrapping/overflowing */
     .sb-user-badge {
         display: flex;
         align-items: center;
@@ -87,8 +80,6 @@ st.markdown("""
         overflow: hidden;
         text-overflow: ellipsis;
     }
-
-    /* Document/topic rows: stretch main button, keep icon button compact */
     section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
         align-items: center;
         gap: 4px;
@@ -99,10 +90,6 @@ st.markdown("""
 init_db()
 
 PENDING_TOPIC_LABEL = "Uploaded – choose a topic"
-
-# ── Session state ─────────────────────────────────────────────────────────────
-# `user` isn't available yet (require_login runs later); the model default uses
-# the env var and gets corrected below once we know who's logged in.
 
 for _k, _v in {
     "agent": None,
@@ -122,8 +109,6 @@ for _k, _v in {
     "session_is_pending": False,
     "_pending_dialog": None,
     "_rag_cache": {},
-    "_docs_cache": None,
-    "_doc_meta_cache": {},
     "model": os.getenv("MODEL"),
     "usage_saved": 0,
     "last_eval": None,
@@ -132,32 +117,50 @@ for _k, _v in {
         st.session_state[_k] = _v
 
 
-# ── Helper functions ─────────────────────────────────────────────────────────
+# ── Cached DB queries ────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _docs_cached(user_id: int) -> list[dict]:
+    return history.list_documents(user_id)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _doc_meta_cached(user_id: int, doc_name: str) -> dict | None:
+    return history.load_document_meta(user_id, doc_name)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _usage_cached(user_id: int, session_id: int) -> dict:
+    return history.usage_by_model(user_id, session_id)
+
 
 @st.cache_resource(show_spinner=False)
-def _build_rag_cached(doc_name: str, document_text: str) -> RAGIndex:
+def _build_rag_cached(user_id: int, doc_name: str, document_text: str) -> RAGIndex:
     return RAGIndex(document_text)
 
 
+# ── Cache-aware accessors ────────────────────────────────────────────────────
+
 def _get_rag(doc_name: str, document_text: str) -> RAGIndex:
+    user = st.session_state.get("user")
+    if not user:
+        raise RuntimeError("No user in session — cannot build RAG index.")
     cache = st.session_state._rag_cache
     if doc_name in cache:
         return cache[doc_name]
     with st.spinner("Loading document model… (first time only)"):
-        rag = _build_rag_cached(doc_name, document_text)
+        rag = _build_rag_cached(user["id"], doc_name, document_text)
     cache[doc_name] = rag
     return rag
 
 
 def _invalidate_docs_cache():
+    _docs_cached.clear()
     st.session_state._docs_cache = None
 
 
 def _invalidate_doc_meta(doc_name: str | None = None):
-    if doc_name is None:
-        st.session_state._doc_meta_cache.clear()
-    else:
-        st.session_state._doc_meta_cache.pop(doc_name, None)
+    _doc_meta_cached.clear()
 
 
 def _invalidate_rag(doc_name: str | None = None):
@@ -175,19 +178,14 @@ def _get_doc_meta(doc_name: str) -> dict | None:
     user = st.session_state.get("user")
     if not user:
         return None
-    cache = st.session_state._doc_meta_cache
-    if doc_name not in cache:
-        cache[doc_name] = history.load_document_meta(user["id"], doc_name)
-    return cache[doc_name]
+    return _doc_meta_cached(user["id"], doc_name)
 
 
 def _get_docs() -> list[dict]:
     user = st.session_state.get("user")
     if not user:
         return []
-    if st.session_state._docs_cache is None:
-        st.session_state._docs_cache = history.list_documents(user["id"])
-    return st.session_state._docs_cache
+    return _docs_cached(user["id"])
 
 
 def _get_mistakes(doc: str | None = None) -> list:
@@ -211,7 +209,6 @@ def _set_mistakes(mistakes: list, doc: str | None = None) -> None:
 
 
 def _save_usage():
-    """Write LLM calls made since the last save to llm_usage."""
     user = st.session_state.get("user")
     agent = st.session_state.agent
     if not user or not agent or not hasattr(agent, "usage"):
@@ -223,8 +220,8 @@ def _save_usage():
             agent.usage[st.session_state.usage_saved:],
         )
         st.session_state.usage_saved = len(agent.usage)
+        _usage_cached.clear()
     except Exception:
-        # If the colleague's usage helpers aren't available, don't crash the app.
         pass
 
 
@@ -315,7 +312,7 @@ def _close_document() -> None:
     st.session_state.session_is_pending = False
 
 
-# ── Dialog infrastructure ─────────────────────────────────────────────────────
+# ── Dialog infrastructure ────────────────────────────────────────────────────
 
 def _close_dialog() -> None:
     st.session_state["_pending_dialog"] = None
@@ -327,10 +324,10 @@ def _dlg_logout():
     st.write("Bist du sicher, dass du dich abmelden möchtest?")
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Cancel", use_container_width=True):
+        if st.button("Cancel", use_container_width=True, key="logout_cancel"):
             _close_dialog()
     with col2:
-        if st.button("Log out", type="primary", use_container_width=True):
+        if st.button("Log out", type="primary", use_container_width=True, key="logout_confirm"):
             _save_usage()
             st.session_state["_pending_dialog"] = None
             logout()
@@ -345,10 +342,10 @@ def _dlg_delete_document(name: str):
     )
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Cancel", use_container_width=True):
+        if st.button("Cancel", use_container_width=True, key="del_doc_cancel"):
             _close_dialog()
     with col2:
-        if st.button("Delete", type="primary", use_container_width=True):
+        if st.button("Delete", type="primary", use_container_width=True, key="del_doc_confirm"):
             user = st.session_state["user"]
             history.delete_document(user["id"], name)
             st.session_state.mistakes_by_user.get(user["id"], {}).pop(name, None)
@@ -370,10 +367,10 @@ def _dlg_hide_topic(topic: str):
     )
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Cancel", use_container_width=True):
+        if st.button("Cancel", use_container_width=True, key="hide_topic_cancel"):
             _close_dialog()
     with col2:
-        if st.button("Hide", type="primary", use_container_width=True):
+        if st.button("Hide", type="primary", use_container_width=True, key="hide_topic_confirm"):
             user = st.session_state["user"]
             doc = st.session_state.active_document
             meta = _get_doc_meta(doc)
@@ -401,10 +398,10 @@ def _dlg_delete_mistake(index: int):
     st.write("Diesen Eintrag aus der Review-Liste entfernen?")
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Cancel", use_container_width=True):
+        if st.button("Cancel", use_container_width=True, key="del_mistake_cancel"):
             _close_dialog()
     with col2:
-        if st.button("Delete", type="primary", use_container_width=True):
+        if st.button("Delete", type="primary", use_container_width=True, key="del_mistake_confirm"):
             mistakes = _get_mistakes()
             if 0 <= index < len(mistakes):
                 mistakes.pop(index)
@@ -422,10 +419,10 @@ def _dlg_clear_mistakes():
     )
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Cancel", use_container_width=True):
+        if st.button("Cancel", use_container_width=True, key="clear_mistakes_cancel"):
             _close_dialog()
     with col2:
-        if st.button("Clear all", type="primary", use_container_width=True):
+        if st.button("Clear all", type="primary", use_container_width=True, key="clear_mistakes_confirm"):
             _set_mistakes([])
             _persist()
             st.session_state["_pending_dialog"] = None
@@ -440,17 +437,16 @@ def _dlg_restart_topic(topic: str):
     )
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Cancel", use_container_width=True):
+        if st.button("Cancel", use_container_width=True, key="restart_topic_cancel"):
             _close_dialog()
     with col2:
-        if st.button("Restart", type="primary", use_container_width=True):
+        if st.button("Restart", type="primary", use_container_width=True, key="restart_topic_confirm"):
             st.session_state["_pending_dialog"] = None
             st.session_state.pending_topic = topic
             st.rerun()
 
 
 def _dispatch_dialog() -> None:
-    """Open at most one dialog per rerun based on `_pending_dialog`."""
     pending = st.session_state.get("_pending_dialog")
     if not pending:
         return
@@ -469,15 +465,13 @@ def _dispatch_dialog() -> None:
         _dlg_restart_topic(pending["topic"])
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Auth ─────────────────────────────────────────────────────────────────────
 
 user = st.session_state.get("user") or require_login()
 if user is None:
     st.stop()
 st.session_state["user"] = user
 
-# Restore the user's preferred model once we know who they are. Wrap in a
-# try/except so a missing history helper doesn't crash the app.
 try:
     preferred = history.get_preferred_model(user["id"])
 except Exception:
@@ -488,7 +482,7 @@ if preferred in MODEL_OPTIONS:
 _dispatch_dialog()
 
 
-# ── Upload & topic start ──────────────────────────────────────────────────────
+# ── Upload & topic start ─────────────────────────────────────────────────────
 
 def _handle_upload(uploaded_file) -> None:
     user = st.session_state["user"]
@@ -496,20 +490,17 @@ def _handle_upload(uploaded_file) -> None:
     if len(text.strip()) < 50:
         raise ValueError("Document appears empty or could not be parsed.")
 
-    # ── Fast heuristic check before any LLM / RAG work ────────────────────
     is_material, reason = check_is_learning_material(text)
     if not is_material:
         raise ValueError(reason)
 
     doc_name = uploaded_file.name
 
-    existing_meta = history.load_document_meta(user["id"], doc_name)
+    existing_meta = _get_doc_meta(doc_name)
     if existing_meta and existing_meta["topics"]:
         topics = existing_meta["topics"]
-        _get_rag(doc_name, text)  # pre-warm the cache
+        _get_rag(doc_name, text)
     else:
-        # LLM-guard also runs inside extract_topics() and can raise ValueError
-        # for borderline documents that slipped past the heuristic.
         rag = _get_rag(doc_name, text)
         agent = StudyBuddyAgent(text, rag)
         if st.session_state.model:
@@ -517,14 +508,12 @@ def _handle_upload(uploaded_file) -> None:
         try:
             topics = agent.extract_topics()
         except ValueError as e:
-            # The document is not lecture material — clean up the half-built
-            # RAG cache so a retry with a correct file does not reuse it.
             _invalidate_rag(doc_name)
             raise ValueError(str(e)) from e
 
         st.session_state.agent = agent
         st.session_state.usage_saved = 0
-        _save_usage()  # topic extraction belongs to no study session yet
+        _save_usage()
 
     hidden = history.get_hidden_topics(user["id"], doc_name)
     topics = [
@@ -641,7 +630,7 @@ def _select_topic(topic: str) -> None:
     _invalidate_doc_meta(doc)
 
 
-# ── Renderers ─────────────────────────────────────────────────────────────────
+# ── Renderers ────────────────────────────────────────────────────────────────
 
 def _render_progress():
     agent = st.session_state.agent
@@ -696,7 +685,7 @@ def _render_usage():
     per_model = {}
     if session_id:
         try:
-            per_model = history.usage_by_model(user["id"], session_id)
+            per_model = _usage_cached(user["id"], session_id)
         except Exception:
             per_model = {}
     if not per_model:
@@ -747,7 +736,6 @@ def _other_models() -> list[str]:
 
 
 def _render_model_actions():
-    """Let the student ask another model for a fresh question or a second opinion."""
     agent: StudyBuddyAgent = st.session_state.agent
     others = _other_models()
     if not others:
@@ -811,7 +799,7 @@ def _render_topics_tab():
             continue
         sessions_by_topic.setdefault(s["topic"], s)
 
-    for topic in st.session_state.topics:
+    for idx, topic in enumerate(st.session_state.topics):
         if not topic or "is_lecture_material" in topic.lower():
             continue
         with st.container(horizontal=True, horizontal_alignment="distribute",
@@ -828,10 +816,10 @@ def _render_topics_tab():
                 else:
                     status = "🟡 in progress"
             label = f"**{topic}**" + (f" — {status}" if status else "")
-            if st.button(label, key=f"open_topic_{topic}", use_container_width=True):
+            if st.button(label, key=f"open_topic_{idx}", use_container_width=True):
                 st.session_state.pending_topic = topic
                 st.rerun()
-            if st.button("🙈", key=f"hide_{topic}", help="Hide this topic and delete its sessions"):
+            if st.button("🙈", key=f"hide_{idx}", help="Hide this topic and delete its sessions"):
                 st.session_state["_pending_dialog"] = {"kind": "hide_topic", "topic": topic}
                 st.rerun()
 
@@ -843,14 +831,18 @@ def _render_review_tab():
         return
     for i, m in enumerate(mistakes, 1):
         answer = m["answer"]
-        if len(answer) > 200:
-            answer = answer[:200].rstrip() + "…"
+        if answer == "(übersprungen)":
+            answer_display = "— *übersprungen* —"
+        elif len(answer) > 200:
+            answer_display = answer[:200].rstrip() + "…"
+        else:
+            answer_display = answer
         with st.container(horizontal=True, horizontal_alignment="distribute",
                           vertical_alignment="top"):
             with st.container():
                 st.markdown(f"**{i}. {m['question']}**")
                 st.caption(" · ".join(filter(None, [m.get("topic", ""), m.get("score", ""), m.get("model", "")])))
-                st.markdown(f"Your answer: {answer}")
+                st.markdown(f"Your answer: {answer_display}")
                 if m.get("missing"):
                     st.markdown(f"Missing: {m['missing']}")
             if st.button("🗑️", key=f"del_mistake_{i}"):
@@ -870,11 +862,11 @@ def _render_hidden_tab():
     if not hidden_list:
         st.caption("No hidden topics for this document.")
         return
-    for topic in hidden_list:
+    for idx, topic in enumerate(hidden_list):
         with st.container(horizontal=True, horizontal_alignment="distribute",
                           vertical_alignment="center"):
             st.markdown(topic)
-            if st.button("👁️", key=f"unhide_{topic}", help="Unhide this topic"):
+            if st.button("👁️", key=f"unhide_{idx}", help="Unhide this topic"):
                 history.unhide_topic(user["id"], doc, topic)
                 if topic not in st.session_state.topics:
                     st.session_state.topics.append(topic)
@@ -882,7 +874,7 @@ def _render_hidden_tab():
                 st.rerun()
 
 
-# ── Pending topic action ──────────────────────────────────────────────────────
+# ── Pending topic action ────────────────────────────────────────────────────
 
 if st.session_state.pending_topic is not None:
     topic = st.session_state.pending_topic
@@ -895,7 +887,7 @@ if st.session_state.pending_topic is not None:
     st.rerun()
 
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── Sidebar ─────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     header_col1, header_col2 = st.columns([3, 2], vertical_alignment="top")
@@ -917,7 +909,7 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-    if st.button("🚪 Log out", use_container_width=True):
+    if st.button("🚪 Log out", use_container_width=True, key="sidebar_logout"):
         st.session_state["_pending_dialog"] = {"kind": "logout"}
         st.rerun()
 
@@ -952,10 +944,9 @@ with st.sidebar:
                     st.rerun()
                 except ValueError as e:
                     msg = str(e)
-                    # Known rejections are shown as a friendly warning.
                     if any(k in msg for k in (
-                            "Lernmaterial", "Rechnung", "Abrechnung",
-                            "zu kurz", "not lecture", "Document appears empty",
+                        "Lernmaterial", "Rechnung", "Abrechnung",
+                        "zu kurz", "not lecture", "Document appears empty",
                     )):
                         st.warning(msg)
                     else:
@@ -964,22 +955,12 @@ with st.sidebar:
                             "Das Dokument konnte nicht verarbeitet werden. "
                             "Bitte lade eine andere Datei hoch."
                         )
-                except Exception as e:
-                    # Any other exception: log the traceback for debugging but
-                    # never leak the raw model output into the UI.
+                except Exception:
                     import traceback
-
                     traceback.print_exc()
                     st.error(
                         "Das Dokument konnte nicht verarbeitet werden. "
                         "Bitte lade eine andere Datei hoch."
-                    )
-                except Exception as e:
-                    print(f"[upload error] {type(e).__name__}: {e}")  # server log
-                    st.error(
-                        "Das Dokument konnte nicht verarbeitet werden. "
-                        "Bitte lade eine andere Datei hoch oder versuche "
-                        "es später erneut."
                     )
     elif st.session_state._uploader_had_file:
         st.session_state._uploader_had_file = False
@@ -990,17 +971,17 @@ with st.sidebar:
     docs = _get_docs()
     if not docs:
         st.caption("Noch keine Dokumente. Lade oben eine Datei hoch.")
-    for d in docs:
+    for idx, d in enumerate(docs):
         name = d["document_name"]
         is_active = (name == st.session_state.active_document)
         label = ("▶ " if is_active else "📄 ") + name
         with st.container(horizontal=True, horizontal_alignment="distribute",
                           vertical_alignment="center"):
-            if st.button(label, key=f"open_doc_{name}", use_container_width=True):
+            if st.button(label, key=f"open_doc_{idx}", use_container_width=True):
                 if not is_active:
                     _open_document(name)
                     st.rerun()
-            if st.button("🗑️", key=f"del_doc_{name}", help="Dieses Dokument und alle zugehörigen Sessions löschen"):
+            if st.button("🗑️", key=f"del_doc_{idx}", help="Dieses Dokument und alle zugehörigen Sessions löschen"):
                 st.session_state["_pending_dialog"] = {"kind": "delete_document", "name": name}
                 st.rerun()
 
@@ -1011,7 +992,7 @@ with st.sidebar:
         _render_usage()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 st.title("StudyBuddy — AI Learning Partner")
 
@@ -1045,7 +1026,7 @@ elif state == "document_open":
 elif state in ("questioning", "feedback", "mastered"):
     top_col1, top_col2 = st.columns([1, 5])
     with top_col1:
-        if st.button("← Topics", use_container_width=True):
+        if st.button("← Topics", use_container_width=True, key="top_back_to_topics"):
             st.session_state.agent = None
             st.session_state.conversation = []
             st.session_state.current_session_id = None
@@ -1061,7 +1042,7 @@ elif state in ("questioning", "feedback", "mastered"):
         _render_model_actions()
 
     if state == "questioning":
-        answer = st.chat_input("Explain your understanding…")
+        answer = st.chat_input("Explain your understanding…", key="chat_input_answer")
         if answer:
             st.session_state.conversation.append(
                 {"role": "user", "content": answer, "type": "answer"}
@@ -1095,6 +1076,17 @@ elif state in ("questioning", "feedback", "mastered"):
                     "model": agent.model,
                 })
                 _set_mistakes(current)
+            elif score == "correct":
+                current = _get_mistakes()
+                filtered = [
+                    m for m in current
+                    if not (
+                        m.get("topic") == agent.current_topic
+                        and m.get("question") == asked_question
+                    )
+                ]
+                if len(filtered) != len(current):
+                    _set_mistakes(filtered)
 
             if agent.topic_complete:
                 st.session_state.conversation.append({
@@ -1140,10 +1132,44 @@ elif state in ("questioning", "feedback", "mastered"):
             _persist()
             st.rerun()
 
+        if st.button("⏭️ Frage überspringen", key="skip_question"):
+            agent = st.session_state.agent
+            skipped_concept = agent.current_concept
+
+            current = _get_mistakes()
+            current.append({
+                "topic": agent.current_topic,
+                "question": agent.current_question,
+                "answer": "(übersprungen)",
+                "missing": skipped_concept,
+                "score": "incorrect",
+                "model": agent.model,
+            })
+            _set_mistakes(current)
+
+            if skipped_concept and skipped_concept in agent.concepts:
+                agent.concepts[skipped_concept] = True
+
+            with st.spinner("Generating next question…"):
+                try:
+                    q = agent.next_question()
+                except Exception as e:
+                    st.error(f"The AI service did not respond ({e}). Please try again.")
+                    st.stop()
+            st.session_state.conversation.append({
+                "role": "assistant",
+                "content": f"⏭️ Okay, wir kommen später darauf zurück. {q}",
+                "type": "question",
+                "model": agent.model,
+            })
+            _save_usage()
+            _persist()
+            st.rerun()
+
     elif state == "feedback":
         col1, col2, col3 = st.columns(3)
         with col1:
-            if st.button("Next Question →", type="primary", use_container_width=True):
+            if st.button("Next Question →", type="primary", use_container_width=True, key="feedback_next_question"):
                 with st.spinner("Generating next question…"):
                     try:
                         q = st.session_state.agent.next_question()
@@ -1159,7 +1185,7 @@ elif state in ("questioning", "feedback", "mastered"):
                 _persist()
                 st.rerun()
         with col2:
-            if st.button("← Topics", use_container_width=True):
+            if st.button("← Topics", use_container_width=True, key="feedback_back_to_topics"):
                 st.session_state.agent = None
                 st.session_state.conversation = []
                 st.session_state.current_session_id = None
@@ -1167,7 +1193,7 @@ elif state in ("questioning", "feedback", "mastered"):
                 st.session_state.app_state = "document_open"
                 st.rerun()
         with col3:
-            if st.button("Restart Topic", use_container_width=True):
+            if st.button("Restart Topic", use_container_width=True, key="feedback_restart_topic"):
                 topic = st.session_state.agent.current_topic if st.session_state.agent else None
                 if topic:
                     st.session_state["_pending_dialog"] = {"kind": "restart_topic", "topic": topic}
@@ -1179,7 +1205,7 @@ elif state in ("questioning", "feedback", "mastered"):
             st.session_state.celebrate = False
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("← Zurück zu Topics", type="primary", use_container_width=True):
+            if st.button("← Zurück zu Topics", type="primary", use_container_width=True, key="mastered_back_to_topics"):
                 st.session_state.agent = None
                 st.session_state.conversation = []
                 st.session_state.current_session_id = None
@@ -1187,7 +1213,7 @@ elif state in ("questioning", "feedback", "mastered"):
                 st.session_state.app_state = "document_open"
                 st.rerun()
         with col2:
-            if st.button("Restart This Topic", use_container_width=True):
+            if st.button("Restart This Topic", use_container_width=True, key="mastered_restart_topic"):
                 topic = st.session_state.agent.current_topic if st.session_state.agent else None
                 if topic:
                     st.session_state["_pending_dialog"] = {"kind": "restart_topic", "topic": topic}

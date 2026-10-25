@@ -91,6 +91,18 @@ def _get_token() -> str | None:
     return st.query_params.get(TOKEN_PARAM)
 
 
+def _clear_all_session_state() -> None:
+    """Wipe every tab-local value.
+
+    Critical for user isolation: when one user logs out and another logs in
+    on the same browser tab, leftover caches (_docs_cache, _doc_meta_cache,
+    _rag_cache, agent, conversation, mistakes_by_user, active_document, ...)
+    would leak the previous user's data into the next session.
+    """
+    for key in list(st.session_state.keys()):
+        st.session_state.pop(key, None)
+
+
 # --------------------------------------------------------------------------
 # Auth screen
 # --------------------------------------------------------------------------
@@ -161,6 +173,10 @@ def _login_form() -> None:
         pass
 
     token = create_session(user["id"])
+
+    # Nuke any leftover state from a previous user on this browser tab.
+    _clear_all_session_state()
+
     st.session_state["user"] = user
 
     if stay_signed_in:
@@ -208,6 +224,10 @@ def _signup_form() -> None:
         return
 
     token = create_session(user["id"])
+
+    # Nuke any leftover state from a previous user on this browser tab.
+    _clear_all_session_state()
+
     st.session_state["user"] = user
 
     if USE_COOKIE:
@@ -266,7 +286,12 @@ def logout() -> None:
     if token:
         delete_session(token)
     _clear_token()
-    st.session_state.pop("user", None)
+
+    # Wipe every tab-local cache so the next user on this browser sees a
+    # clean slate. Without this, documents / mistakes / agent state from the
+    # previous user would leak into the next login.
+    _clear_all_session_state()
+
     if USE_COOKIE:
         _clear_cookie_and_reload()
     st.rerun()

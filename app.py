@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from agent.models import load_model_options
+from agent.models import load_model_efforts, load_model_options
 from agent.study_agent import StudyBuddyAgent
 from tools.document_loader import load_document
 from tools.document_validator import check_is_learning_material
@@ -22,6 +22,7 @@ except Exception:
     pass
 
 MODEL_OPTIONS = load_model_options()
+MODEL_EFFORTS = load_model_efforts()
 CONTEXT_WARN_SHARE = float(os.getenv("CONTEXT_WARN_SHARE", "0.4"))
 USAGE_BLOCK_HOURS = float(os.getenv("USAGE_BLOCK_HOURS", "5"))
 
@@ -113,6 +114,8 @@ for _k, _v in {
     "_rag_cache": {},
     "model": os.getenv("MODEL"),
     "usage_saved": 0,
+    # Reasoning effort per model, starting at each model's own default; always sent
+    "efforts_by_model": {m: default for m, (_, default) in MODEL_EFFORTS.items()},
     "last_eval": None,
 }.items():
     if _k not in st.session_state:
@@ -513,6 +516,7 @@ def _handle_upload(uploaded_file) -> None:
         agent = StudyBuddyAgent(text, rag)
         if st.session_state.model:
             agent.model = st.session_state.model
+        agent.efforts = st.session_state.efforts_by_model
         try:
             topics = agent.extract_topics()
         except ValueError as e:
@@ -569,6 +573,7 @@ def _select_topic(topic: str) -> None:
         agent = StudyBuddyAgent(meta["document_text"], rag)
         if st.session_state.model:
             agent.model = st.session_state.model
+        agent.efforts = st.session_state.efforts_by_model
         agent.concepts = existing["concepts"]
         agent.current_topic = existing["topic"]
         agent.current_concept = existing["current_concept"]
@@ -595,6 +600,7 @@ def _select_topic(topic: str) -> None:
     agent = StudyBuddyAgent(st.session_state.document_text, rag)
     if st.session_state.model:
         agent.model = st.session_state.model
+    agent.efforts = st.session_state.efforts_by_model
     question = agent.start_topic(topic)
     n_concepts = len(agent.concepts)
 
@@ -962,8 +968,23 @@ with st.sidebar:
             on_change=_save_preferred_model,
             help="Pick the model you trust. You can switch at any time; your progress is kept.",
         )
+    if st.session_state.model in MODEL_EFFORTS:
+        model = st.session_state.model
+        levels, default = MODEL_EFFORTS[model]
+        current = st.session_state.efforts_by_model.get(model, default)
+        st.session_state.efforts_by_model[model] = st.select_slider(
+            "🧠 Effort",
+            options=levels,
+            value=current if current in levels else default,
+            # One widget per model, so each model keeps its own choice
+            key=f"effort_{model}",
+            help="How thoroughly the model thinks before answering: none = no thinking, "
+                 "xhigh = most careful but slowest and most tokens. Only levels this model "
+                 "supports are listed; the preselected one is the model's own default.",
+        )
     if st.session_state.agent and st.session_state.model:
         st.session_state.agent.model = st.session_state.model
+        st.session_state.agent.efforts = st.session_state.efforts_by_model
 
     uploaded = st.file_uploader(
         "Upload lecture material",

@@ -357,3 +357,40 @@ def test_usage_recorded_per_call():
     agent.client.chat.completions.create.return_value = resp
     agent._complete([{"role": "user", "content": "hi"}], "M2")
     assert agent.usage == [{"model": "M2", "prompt_tokens": 120, "completion_tokens": 30}]
+
+
+# ── Reasoning effort ─────────────────────────────────────────────────────────
+
+def _fake_response(text="{}"):
+    resp = MagicMock()
+    resp.choices[0].message.content = text
+    resp.usage.prompt_tokens = 1
+    resp.usage.completion_tokens = 1
+    return resp
+
+
+def test_effort_sent_only_for_the_model_it_was_chosen_for():
+    agent = make_agent()
+    agent.model = "M1"
+    agent.efforts = {"M1": "high"}
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = _fake_response()
+
+    agent._complete([{"role": "user", "content": "hi"}])
+    assert agent.client.chat.completions.create.call_args.kwargs["reasoning_effort"] == "high"
+
+    agent._complete([{"role": "user", "content": "hi"}], "M2")  # e.g. a second opinion
+    assert "reasoning_effort" not in agent.client.chat.completions.create.call_args.kwargs
+
+
+def test_unsupported_effort_falls_back_to_server_default():
+    agent = make_agent()
+    agent.model = "M1"
+    agent.efforts = {"M1": "xhigh"}
+    rejected = Exception("reasoning_effort='xhigh' is not supported")
+    rejected.status_code = 400
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [rejected, _fake_response("ok")]
+
+    assert agent._complete([{"role": "user", "content": "hi"}]) == "ok"
+    assert "reasoning_effort" not in agent.client.chat.completions.create.call_args.kwargs

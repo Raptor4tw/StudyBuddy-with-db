@@ -174,19 +174,32 @@ class StudyBuddyAgent:
         # Concepts the student skipped; asked again once the others are done
         self.skipped: list[str] = []
         self.usage: list[dict] = []
+        # Reasoning effort per model ({model: "low" | "medium" | ...}); a model
+        # missing here is called without the parameter, i.e. its server default.
+        self.efforts: dict[str, str] = {}
 
     def _complete(self, messages: list, model: str | None = None) -> str:
         """Call the LLM, retrying when the endpoint is momentarily saturated."""
+        model = model or self.model
+        extra = {}
+        if self.efforts.get(model):
+            extra["reasoning_effort"] = self.efforts[model]
         delay = _RETRY_BASE_DELAY
         for attempt in range(_MAX_RETRIES):
             try:
                 resp = self.client.chat.completions.create(
-                    model=model or self.model,
+                    model=model,
                     messages=messages,
+                    **extra,
                 )
-                self._record_usage(model or self.model, resp)
+                self._record_usage(model, resp)
                 return resp.choices[0].message.content or ""
             except Exception as e:
+                # A level the model does not accept (misconfigured MODELS) should
+                # not break the session: retry once with the server default.
+                if extra and "reasoning" in str(e).lower() and getattr(e, "status_code", None) == 400:
+                    extra = {}
+                    continue
                 if attempt == _MAX_RETRIES - 1 or not _is_retryable(e):
                     raise
                 time.sleep(delay + random.uniform(0, 0.4))

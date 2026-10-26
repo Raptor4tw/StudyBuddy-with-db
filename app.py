@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from agent.models import load_model_efforts, load_model_options
-from agent.study_agent import StudyBuddyAgent
+from agent.study_agent import QUIZ_KINDS, StudyBuddyAgent, quiz_done_from_conversation
 from tools.document_loader import load_document
 from tools.document_validator import check_is_learning_material
 from tools.rag import RAGIndex
@@ -588,9 +588,16 @@ def _select_topic(topic: str) -> None:
         st.session_state.session_is_pending = False
         st.session_state.active_topic = topic
         st.session_state.usage_saved = 0
+        agent.quiz_done = quiz_done_from_conversation(existing["conversation"])
+        last = existing["conversation"][-1] if existing["conversation"] else {}
+        if last.get("type") == "quiz" and last.get("quiz"):
+            agent.current_quiz = dict(last["quiz"])
 
         if agent.topic_complete:
             st.session_state.app_state = "mastered"
+        elif agent.concepts_complete:
+            # A missing open question is generated when the quiz state renders
+            st.session_state.app_state = "quiz"
         else:
             last_type = existing["conversation"][-1]["type"] if existing["conversation"] else None
             st.session_state.app_state = "questioning" if last_type == "question" else "feedback"
@@ -644,17 +651,47 @@ def _select_topic(topic: str) -> None:
     _invalidate_doc_meta(doc)
 
 
+def _start_next_quiz() -> bool:
+    """Ask the next closed question. On failure, show the error and stay in
+    "feedback", whose button tries again. Returns True on success."""
+    agent = st.session_state.agent
+    with st.spinner("Generating the next question…"):
+        try:
+            quiz = agent.generate_quiz()
+        except Exception as e:
+            st.session_state.app_state = "feedback"
+            st.error(f"The AI service did not return a question ({e}). Please try again.")
+            return False
+    st.session_state.conversation.append({
+        "role": "assistant", "content": quiz["question"], "type": "quiz",
+        "quiz": quiz, "model": agent.model,
+    })
+    st.session_state.app_state = "quiz"
+    return True
+
+
 # ── Renderers ────────────────────────────────────────────────────────────────
+
+QUIZ_LABELS = {"mcq": "Multiple Choice", "tf": "Wahr oder falsch?"}
+
+
+def _quiz_answer_text(quiz: dict, choice) -> str:
+    if quiz["kind"] == "mcq":
+        return quiz["options"][choice]
+    return "Wahr" if choice else "Falsch"
+
 
 def _render_progress():
     agent = st.session_state.agent
     if not agent or not agent.concepts:
         return
     done, total = agent.progress
-    st.progress(done / total, text=f"Concepts mastered: {done}/{total}")
-    with st.expander("Concept checklist"):
+    st.progress(done / total, text=f"Mastered: {done}/{total}")
+    with st.expander("Checklist"):
         for concept, covered in agent.concepts.items():
             st.markdown(f"{'✅' if covered else '⬜'} {concept}")
+        for kind in QUIZ_KINDS:
+            st.markdown(f"{'✅' if agent.quiz_done[kind] else '⬜'} {QUIZ_LABELS[kind]}")
 
 
 def _render_feedback(content: str, score: str):
@@ -667,11 +704,20 @@ def _render_feedback(content: str, score: str):
 
 
 def _render_conversation():
-    for msg in st.session_state.conversation:
+    conversation = st.session_state.conversation
+    for i, msg in enumerate(conversation):
         with st.chat_message(msg["role"]):
             t = msg["type"]
             if t == "question":
                 st.markdown(f"**{msg['content']}**")
+            elif t == "quiz":
+                quiz = msg.get("quiz") or {}
+                st.caption(QUIZ_LABELS.get(quiz.get("kind"), "Quiz"))
+                st.markdown(f"**{msg['content']}**")
+                # The open question's options are shown as the answer widget below
+                is_open = i == len(conversation) - 1 and st.session_state.app_state == "quiz"
+                if quiz.get("kind") == "mcq" and not is_open:
+                    st.markdown("\n".join(f"- {o}" for o in quiz.get("options", [])))
             elif t == "intro":
                 st.info(msg["content"])
             elif t == "mastered":
@@ -853,11 +899,13 @@ def _render_topics_tab():
             status = ""
             if s:
                 concepts = s["concepts"] or {}
-                if concepts and all(concepts.values()):
+                quiz = quiz_done_from_conversation(s.get("conversation"))
+                done = sum(1 for v in concepts.values() if v) + sum(quiz.values())
+                total = len(concepts) + len(QUIZ_KINDS)
+                if concepts and done == total:
                     status = "✅ mastered"
                 elif concepts:
-                    done = sum(1 for v in concepts.values() if v)
-                    status = f"🟡 {done}/{len(concepts)}"
+                    status = f"🟡 {done}/{total}"
                 else:
                     status = "🟡 in progress"
             label = f"**{topic}**" + (f" — {status}" if status else "")
@@ -1094,7 +1142,7 @@ elif state == "document_open":
     with tab_hidden:
         _render_hidden_tab()
 
-elif state in ("questioning", "feedback", "mastered"):
+elif state in ("questioning", "feedback", "quiz", "mastered"):
     top_col1, top_col2 = st.columns([1, 5])
     with top_col1:
         if st.button("← Topics", use_container_width=True, key="top_back_to_topics"):
@@ -1165,7 +1213,7 @@ elif state in ("questioning", "feedback", "mastered"):
                 if len(filtered) != len(current):
                     _set_mistakes(filtered)
 
-            if agent.topic_complete:
+            if agent.concepts_complete:
                 st.session_state.conversation.append({
                     "role": "assistant",
                     "content": f"Correct! {feedback}" if score == "correct" else feedback,
@@ -1174,11 +1222,11 @@ elif state in ("questioning", "feedback", "mastered"):
                 })
                 st.session_state.conversation.append({
                     "role": "assistant",
-                    "content": f"🎉 You've explained all key concepts of **{agent.current_topic}** — topic mastered!",
-                    "type": "mastered",
+                    "content": "Alle Konzepte erklärt! Zum Abschluss zwei kurze Fragen: "
+                               "eine Multiple-Choice- und eine Wahr-oder-falsch-Frage.",
+                    "type": "intro",
                 })
-                st.session_state.celebrate = True
-                st.session_state.app_state = "mastered"
+                _start_next_quiz()
             elif score == "correct":
                 st.session_state.conversation.append({
                     "role": "assistant",
@@ -1245,6 +1293,12 @@ elif state in ("questioning", "feedback", "mastered"):
         col1, col2, col3 = st.columns(3)
         with col1:
             if st.button("Next Question →", type="primary", use_container_width=True, key="feedback_next_question"):
+                if st.session_state.agent.concepts_complete:
+                    if not _start_next_quiz():
+                        st.stop()
+                    _save_usage()
+                    _persist()
+                    st.rerun()
                 with st.spinner("Generating next question…"):
                     try:
                         q = st.session_state.agent.next_question()
@@ -1273,6 +1327,76 @@ elif state in ("questioning", "feedback", "mastered"):
                 if topic:
                     st.session_state["_pending_dialog"] = {"kind": "restart_topic", "topic": topic}
                     st.rerun()
+
+    elif state == "quiz":
+        agent = st.session_state.agent
+        if agent.current_quiz is None:
+            # Resumed session, or a question failed to generate before
+            if _start_next_quiz():
+                _save_usage()
+                _persist()
+                st.rerun()
+            st.stop()
+        quiz = agent.current_quiz
+        # Keyed by position so a new question starts with nothing selected
+        key = f"quiz_{len(st.session_state.conversation)}"
+        choice = None
+        if quiz["kind"] == "mcq":
+            picked = st.radio("Your answer", range(len(quiz["options"])), index=None,
+                              format_func=lambda i: quiz["options"][i], key=f"{key}_choice")
+            if st.button("Antwort abgeben", type="primary", disabled=picked is None, key=f"{key}_submit"):
+                choice = picked
+        else:
+            col_true, col_false = st.columns(2)
+            if col_true.button("✅ Wahr", use_container_width=True, key=f"{key}_true"):
+                choice = True
+            if col_false.button("❌ Falsch", use_container_width=True, key=f"{key}_false"):
+                choice = False
+
+        if choice is not None:
+            result = agent.answer_quiz(choice)
+            chosen = _quiz_answer_text(quiz, choice)
+            right = _quiz_answer_text(quiz, quiz["answer"])
+            st.session_state.conversation.append({"role": "user", "content": chosen, "type": "answer"})
+            if result["correct"]:
+                content = f"Richtig! {quiz['explanation']}".strip()
+                # Earlier wrong attempts of this kind are resolved now
+                _set_mistakes([
+                    m for m in _get_mistakes()
+                    if not (m.get("topic") == agent.current_topic and m.get("quiz") == quiz["kind"])
+                ])
+            else:
+                content = f"Leider falsch. Richtig ist: **{right}**. {quiz['explanation']}".strip()
+                current = _get_mistakes()
+                current.append({
+                    "topic": agent.current_topic,
+                    "question": quiz["question"],
+                    "quiz": quiz["kind"],
+                    "answer": chosen,
+                    "missing": right,
+                    "score": "incorrect",
+                    "model": agent.model,
+                })
+                _set_mistakes(current)
+            st.session_state.conversation.append({
+                "role": "assistant", "content": content, "type": "feedback",
+                "score": "correct" if result["correct"] else "incorrect",
+                "quiz": quiz["kind"], "model": agent.model,
+            })
+            if agent.topic_complete:
+                st.session_state.conversation.append({
+                    "role": "assistant",
+                    "content": f"🎉 You've mastered **{agent.current_topic}** — all key concepts and both final questions!",
+                    "type": "mastered",
+                })
+                st.session_state.celebrate = True
+                st.session_state.app_state = "mastered"
+            else:
+                # Next kind after a correct answer, a new one of the same kind after a wrong one
+                _start_next_quiz()
+            _save_usage()
+            _persist()
+            st.rerun()
 
     elif state == "mastered":
         if st.session_state.celebrate:

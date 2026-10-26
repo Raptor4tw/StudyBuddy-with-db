@@ -13,6 +13,9 @@ from agent.prompts import (
     EVALUATION_PROMPT,
     FOLLOW_UP_PROMPT,
     QUESTION_GENERATION_PROMPT,
+    QUIZ_PROMPT,
+    QUIZ_TASK_MCQ,
+    QUIZ_TASK_TF,
     TOPIC_EXTRACTION_PROMPT,
 )
 from tools.rag import RAGIndex
@@ -155,6 +158,42 @@ def _sanitize_concepts(concepts: list[str]) -> list[str]:
     return result or concepts
 
 
+# Closed questions that end every topic, asked in this order once all concepts
+# are mastered; a wrong answer brings a new question of the same kind.
+QUIZ_KINDS = ("mcq", "tf")
+
+
+def _valid_quiz(kind: str, data) -> dict | None:
+    """Return a clean quiz dict, or None if the model's JSON is unusable."""
+    if not isinstance(data, dict):
+        return None
+    explanation = str(data.get("explanation") or "").strip()
+    if kind == "mcq":
+        question = str(data.get("question") or "").strip()
+        options = [str(o).strip() for o in data.get("options") or []]
+        answer = data.get("answer")
+        if (not question or len(options) != 4 or not all(options)
+                or len(set(options)) != 4 or not isinstance(answer, int)
+                or isinstance(answer, bool) or not 0 <= answer < 4):
+            return None
+        return {"kind": "mcq", "question": question, "options": options,
+                "answer": answer, "explanation": explanation}
+    statement = str(data.get("statement") or "").strip()
+    if not statement:
+        return None
+    return {"kind": "tf", "question": statement, "explanation": explanation}
+
+
+def quiz_done_from_conversation(conversation: list) -> dict[str, bool]:
+    """Which closed questions were answered correctly, read from a saved
+    conversation (quiz results are stored there, so no extra DB column)."""
+    done = {k: False for k in QUIZ_KINDS}
+    for m in conversation or []:
+        if m.get("type") == "feedback" and m.get("quiz") in done and m.get("score") == "correct":
+            done[m["quiz"]] = True
+    return done
+
+
 class StudyBuddyAgent:
     def __init__(self, text: str, rag: RAGIndex):
         self.text = text
@@ -173,6 +212,9 @@ class StudyBuddyAgent:
         self.max_follow_ups: int = 999  # effectively unlimited; the user skips manually
         # Concepts the student skipped; asked again once the others are done
         self.skipped: list[str] = []
+        # Closed questions at the end of the topic
+        self.quiz_done: dict[str, bool] = {k: False for k in QUIZ_KINDS}
+        self.current_quiz: dict | None = None
         self.usage: list[dict] = []
         # Reasoning effort per model ({model: "low" | "medium" | ...}); a model
         # missing here is called without the parameter, i.e. its server default.
@@ -289,11 +331,22 @@ class StudyBuddyAgent:
 
     @property
     def progress(self) -> tuple[int, int]:
-        return sum(self.concepts.values()), len(self.concepts)
+        """(done, total) over the concepts plus the closed questions."""
+        if not self.concepts:
+            return 0, 0
+        done = sum(self.concepts.values()) + sum(self.quiz_done.values())
+        return done, len(self.concepts) + len(QUIZ_KINDS)
+
+    @property
+    def concepts_complete(self) -> bool:
+        return bool(self.concepts) and all(self.concepts.values())
 
     @property
     def topic_complete(self) -> bool:
-        return bool(self.concepts) and all(self.concepts.values())
+        return self.concepts_complete and all(self.quiz_done.values())
+
+    def next_quiz_kind(self) -> str | None:
+        return next((k for k in QUIZ_KINDS if not self.quiz_done[k]), None)
 
     def _next_uncovered(self) -> str | None:
         uncovered = [c for c, covered in self.concepts.items() if not covered]
@@ -312,6 +365,8 @@ class StudyBuddyAgent:
         self.follow_up_count = 0
         self.asked_questions = []
         self.skipped = []
+        self.quiz_done = {k: False for k in QUIZ_KINDS}
+        self.current_quiz = None
         context = self.rag.retrieve(topic, k=4)
         self.concepts = {c: False for c in self._extract_concepts(topic, context)}
         return self._generate_question()
@@ -363,8 +418,8 @@ class StudyBuddyAgent:
         if parsed.get("score") == "correct" and self.current_concept in self.concepts:
             self.concepts[self.current_concept] = True
 
-        # No follow-ups needed once the whole topic is mastered
-        if self.topic_complete:
+        # No follow-ups needed once every concept is mastered
+        if self.concepts_complete:
             parsed["follow_up"] = None
 
         # Every wrong/partial answer gets a follow-up until the concept is correct.
@@ -373,7 +428,7 @@ class StudyBuddyAgent:
         # concept its follow-up targets; if that is not the focus concept, or
         # there is no follow-up, a narrow prompt that only knows the focus
         # concept writes one instead.
-        if parsed.get("score") in ("partial", "incorrect") and not self.topic_complete:
+        if parsed.get("score") in ("partial", "incorrect") and not self.concepts_complete:
             follow_up = (parsed.get("follow_up") or "").strip()
             if not follow_up or not self._is_focus(parsed.get("follow_up_concept")):
                 follow_up = self._focused_follow_up(student_answer, parsed.get("missing"))
@@ -407,6 +462,51 @@ class StudyBuddyAgent:
         except Exception:
             follow_up = ""
         return follow_up or self.current_question
+
+    def generate_quiz(self, model: str | None = None) -> dict:
+        """Write the next closed question (multiple choice, then true/false).
+        Retries once on unusable JSON; raises ValueError if both attempts fail."""
+        kind = self.next_quiz_kind()
+        if kind is None:
+            raise ValueError("Both closed questions are already answered.")
+        # Models put the right option first and lean towards "true", so the
+        # option order and the truth of the statement are decided here.
+        truth = random.choice([True, False])
+        task = QUIZ_TASK_MCQ if kind == "mcq" else QUIZ_TASK_TF.format(truth="TRUE" if truth else "FALSE")
+        prompt = QUIZ_PROMPT.format(
+            topic=self.current_topic or "the material",
+            concepts=", ".join(self.concepts),
+            context=self.rag.retrieve(self.current_topic or "", k=5),
+            asked="\n".join(f"- {q}" for q in self.asked_questions) or "(none yet)",
+            task=task,
+        )
+        for _ in range(2):
+            quiz = _valid_quiz(kind, _parse_json(self._complete([{"role": "user", "content": prompt}], model)))
+            if quiz:
+                break
+        else:
+            raise ValueError("The model did not return a usable question.")
+        if kind == "mcq":
+            correct = quiz["options"][quiz["answer"]]
+            random.shuffle(quiz["options"])
+            quiz["answer"] = quiz["options"].index(correct)
+        else:
+            quiz["answer"] = truth
+        self.current_quiz = quiz
+        self.asked_questions.append(quiz["question"])
+        return quiz
+
+    def answer_quiz(self, choice) -> dict:
+        """Grade the open closed question: an option index, or True/False.
+        No LLM call — the right answer is known."""
+        quiz = self.current_quiz
+        if quiz is None:
+            raise ValueError("No closed question is open.")
+        correct = choice == quiz["answer"]
+        if correct:
+            self.quiz_done[quiz["kind"]] = True
+            self.current_quiz = None
+        return {"correct": correct, **quiz}
 
     def second_opinion(self, question: str, student_answer: str, model: str) -> dict:
         """Re-judge an earlier answer with another model. Display only."""

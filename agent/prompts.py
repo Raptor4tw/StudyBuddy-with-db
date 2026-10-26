@@ -158,3 +158,42 @@ Rules:
 
 Return ONLY the question text. No preamble, no explanation.
 """
+
+
+QUIZ_PROMPT = """\
+You are StudyBuddy, an AI learning partner. The student has explained every key concept of a
+topic. Write ONE closed question as a final check.
+
+STRICT RULE: Base the question ONLY on the CONTEXT below. Do NOT use your general knowledge.
+
+Topic: {topic}
+Key concepts: {concepts}
+
+CONTEXT (from lecture material):
+{context}
+
+Questions already asked in this session (do NOT repeat or rephrase them):
+{asked}
+
+{task}
+
+Write everything in the same language as the CONTEXT.
+Return ONLY the JSON object — no markdown, no code fence, no text before or after.
+"""
+
+QUIZ_TASK_MCQ = """\
+Type: multiple choice with exactly 4 options and exactly ONE correct option.
+- The wrong options must be plausible to someone who did not study the material.
+- Options are short (under 15 words) and of similar length; no "all of the above".
+- "answer" is the 0-based index of the correct option.
+- "explanation": one sentence on why the correct option is right.
+
+{{"question": "...", "options": ["...", "...", "...", "..."], "answer": 2, "explanation": "..."}}"""
+
+QUIZ_TASK_TF = """\
+Type: true/false. Write ONE clear statement that is {truth} according to the CONTEXT.
+- No trick wording, no double negatives, one fact only, under 25 words.
+- "explanation": one sentence on why the statement is {truth}.
+
+{{"statement": "...", "explanation": "..."}}"""
+

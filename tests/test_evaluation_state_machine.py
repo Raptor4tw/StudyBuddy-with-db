@@ -70,14 +70,14 @@ def test_correct_answer_masters_only_the_focus_concept():
         "follow_up_concept": "C3", "missing": "C3", "covered_concepts": ["C4"],
     })
     agent.evaluate_answer("wrong")
-    assert agent.progress == (2, 5)
+    assert agent.progress == (2, 7)  # 5 concepts + 2 closed questions
 
     mock_llm_response(agent, {
         "score": "correct", "feedback": "Yes.", "follow_up": None,
         "missing": None, "covered_concepts": ["C3", "C4", "C5"],
     })
     agent.evaluate_answer("right")
-    assert agent.progress == (3, 5)
+    assert agent.progress == (3, 7)
     assert agent.concepts["C3"] is True
     assert agent.concepts["C4"] is False
 
@@ -394,3 +394,83 @@ def test_unsupported_effort_falls_back_to_server_default():
 
     assert agent._complete([{"role": "user", "content": "hi"}]) == "ok"
     assert "reasoning_effort" not in agent.client.chat.completions.create.call_args.kwargs
+
+
+# ── Closed questions at the end of a topic ───────────────────────────────────
+
+from agent.study_agent import quiz_done_from_conversation
+
+
+def _mastered_agent():
+    return make_agent(concepts={"1NF definition": True, "2NF definition": True, "3NF definition": True})
+
+
+def test_topic_needs_both_closed_questions_after_the_concepts():
+    agent = _mastered_agent()
+    assert agent.concepts_complete
+    assert not agent.topic_complete
+    assert agent.progress == (3, 5)
+    assert agent.next_quiz_kind() == "mcq"
+
+
+def test_mcq_options_are_shuffled_and_answer_follows_the_correct_option():
+    agent = _mastered_agent()
+    mock_llm_response(agent, {
+        "question": "Which dependency does 3NF remove?",
+        "options": ["Transitive", "Partial", "Multivalued", "Join"],
+        "answer": 0,
+        "explanation": "3NF removes transitive dependencies.",
+    })
+    for _ in range(20):
+        quiz = agent.generate_quiz()
+        assert quiz["options"][quiz["answer"]] == "Transitive"
+        assert sorted(quiz["options"]) == ["Join", "Multivalued", "Partial", "Transitive"]
+
+
+def test_wrong_mcq_keeps_it_open_then_correct_moves_to_true_false():
+    agent = _mastered_agent()
+    mock_llm_response(agent, {
+        "question": "Q?", "options": ["a", "b", "c", "d"], "answer": 1, "explanation": "b.",
+    })
+    quiz = agent.generate_quiz()
+    wrong = (quiz["answer"] + 1) % 4
+
+    assert agent.answer_quiz(wrong)["correct"] is False
+    assert agent.next_quiz_kind() == "mcq"  # same kind again
+
+    quiz = agent.generate_quiz()
+    assert agent.answer_quiz(quiz["answer"])["correct"] is True
+    assert agent.next_quiz_kind() == "tf"
+    assert agent.progress == (4, 5)
+
+
+def test_true_false_truth_is_decided_in_code(monkeypatch):
+    agent = _mastered_agent()
+    agent.quiz_done["mcq"] = True
+    mock_llm_response(agent, {"statement": "3NF allows transitive dependencies.", "explanation": "It removes them."})
+    monkeypatch.setattr("agent.study_agent.random.choice", lambda seq: False)
+
+    quiz = agent.generate_quiz()
+
+    assert quiz["kind"] == "tf" and quiz["answer"] is False
+    assert "FALSE according to the CONTEXT" in agent._complete.call_args.args[0][0]["content"]
+    assert agent.answer_quiz(False)["correct"] is True
+    assert agent.topic_complete
+
+
+def test_unusable_quiz_json_retries_then_raises():
+    agent = _mastered_agent()
+    agent._complete = MagicMock(return_value=json.dumps({"question": "Q?", "options": ["a", "a", "b", "c"], "answer": 0}))
+    with pytest.raises(ValueError):
+        agent.generate_quiz()
+    assert agent._complete.call_count == 2
+
+
+def test_quiz_progress_restored_from_saved_conversation():
+    conversation = [
+        {"type": "quiz", "quiz": {"kind": "mcq"}},
+        {"type": "feedback", "quiz": "mcq", "score": "incorrect"},
+        {"type": "feedback", "quiz": "mcq", "score": "correct"},
+        {"type": "feedback", "score": "correct"},  # a concept answer, not a quiz
+    ]
+    assert quiz_done_from_conversation(conversation) == {"mcq": True, "tf": False}

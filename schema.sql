@@ -63,3 +63,4 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 
 CREATE INDEX IF NOT EXISTS idx_llm_usage_user ON llm_usage(user_id);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_session ON llm_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_user_time ON llm_usage(user_id, created_at);

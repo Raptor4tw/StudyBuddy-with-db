@@ -1,4 +1,4 @@
-from agent.study_agent import _mark_covered, _parse_json, _sample_text, _strip_thinking
+from agent.study_agent import _parse_json, _sample_text, _strip_thinking
 
 
 class TestStripThinking:
@@ -46,25 +46,3 @@ class TestSampleText:
         sample = _sample_text(text, total_chars=4800, sections=3)
         separator_overhead = 2 * len("\n\n[...]\n\n")
         assert len(sample) <= 4800 + separator_overhead
-
-
-class TestMarkCovered:
-    def test_exact_match(self):
-        concepts = {"ARP Spoofing": False, "VLANs": False}
-        _mark_covered(concepts, ["ARP Spoofing"])
-        assert concepts == {"ARP Spoofing": True, "VLANs": False}
-
-    def test_case_and_whitespace_insensitive(self):
-        concepts = {"MAC Addresses": False}
-        _mark_covered(concepts, ["  mac addresses "])
-        assert concepts["MAC Addresses"] is True
-
-    def test_unknown_names_ignored(self):
-        concepts = {"A": False}
-        _mark_covered(concepts, ["B", None, 42])
-        assert concepts == {"A": False}
-
-    def test_empty_list_changes_nothing(self):
-        concepts = {"A": False}
-        _mark_covered(concepts, [])
-        assert concepts == {"A": False}

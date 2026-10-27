@@ -11,7 +11,11 @@ from openai import OpenAI
 from agent.prompts import (
     CONCEPT_EXTRACTION_PROMPT,
     EVALUATION_PROMPT,
+    FOLLOW_UP_PROMPT,
     QUESTION_GENERATION_PROMPT,
+    QUIZ_PROMPT,
+    QUIZ_TASK_MCQ,
+    QUIZ_TASK_TF,
     TOPIC_EXTRACTION_PROMPT,
 )
 from tools.rag import RAGIndex
@@ -52,23 +56,36 @@ def _parse_json(text: str):
     return None
 
 
-def _sample_text(text: str, total_chars: int = 4800, sections: int = 3) -> str:
-    """Sample evenly spaced sections so long documents are represented beyond their start."""
+def _sample_text(text: str, total_chars: int | None = None, sections: int = 3) -> str:
+    """Sample evenly spaced sections so long documents are fully represented.
+
+    The sample budget scales with the document: a 5-page note uses the whole
+    text, a 100-page script uses up to 15,000 chars spread across more sections.
+    """
+    if total_chars is None:
+        if len(text) <= 6000:
+            total_chars = len(text)
+            sections = 1
+        elif len(text) <= 20000:
+            total_chars = 8000
+            sections = 3
+        elif len(text) <= 60000:
+            total_chars = 12000
+            sections = 5
+        else:
+            total_chars = 15000
+            sections = 7
+
     if len(text) <= total_chars:
         return text
+
     piece = total_chars // sections
+    if sections == 1:
+        return text[:total_chars]
     stride = (len(text) - piece) // (sections - 1)
     return "\n\n[...]\n\n".join(
         text[i * stride : i * stride + piece] for i in range(sections)
     )
-
-
-def _mark_covered(concepts: dict, names: list) -> None:
-    by_norm = {c.strip().lower(): c for c in concepts}
-    for name in names:
-        key = by_norm.get(str(name).strip().lower())
-        if key:
-            concepts[key] = True
 
 
 def _is_broken_topic(s: str) -> bool:
@@ -81,13 +98,10 @@ def _is_broken_topic(s: str) -> bool:
         return True
     if low in {"topics", "topic", "json", "true", "false", "null"}:
         return True
-    # Drop JSON-ish leftovers
     if any(ch in s for ch in "{}[]"):
         return True
-    # Drop names that start with a quote or colon (broken JSON fragment)
     if s[0] in "\"':" or s[-1] in "\"':":
         return True
-    # Length sanity
     if len(s) < 3 or len(s) > 80:
         return True
     return False
@@ -98,7 +112,6 @@ def _clean_topics(items) -> list[str]:
     if not items:
         return []
     if isinstance(items, dict):
-        # If the model returned {topics: [...]}, unwrap it.
         items = items.get("topics") or []
     cleaned: list[str] = []
     for t in items:
@@ -108,6 +121,77 @@ def _clean_topics(items) -> list[str]:
         if s not in cleaned:
             cleaned.append(s)
     return cleaned
+
+
+def _sanitize_concepts(concepts: list[str]) -> list[str]:
+    """Clean up concepts that the model returned as combined lists.
+
+    The model sometimes returns things like "Knoten, Beziehungen und Eigenschaften"
+    instead of three separate concepts. We split those and drop too-generic ones.
+    """
+    result: list[str] = []
+    for c in concepts:
+        c = c.strip()
+        if not c:
+            continue
+        # Split on " und ", ", ", " / ", " & " — but only if the result
+        # has at least 2 parts with >= 3 chars each
+        parts: list[str] = [c]
+        for sep in [" und ", ", ", " / ", " & ", "; "]:
+            new_parts = []
+            for p in parts:
+                new_parts.extend(p.split(sep))
+            parts = [p.strip() for p in new_parts if p.strip()]
+        # If we got multiple parts, keep them as separate concepts
+        if len(parts) > 1 and all(len(p) >= 3 for p in parts):
+            for p in parts:
+                if p not in result and len(p) <= 80:
+                    result.append(p)
+            continue
+        # Too long, too short, or too generic → reject
+        if len(c) < 4 or len(c) > 80:
+            continue
+        if c.lower() in {"cypher", "neo4j", "datenbank", "sql", "python", "c++", "java"}:
+            continue
+        if c not in result:
+            result.append(c)
+    return result or concepts
+
+
+# Closed questions that end every topic, asked in this order once all concepts
+# are mastered; a wrong answer brings a new question of the same kind.
+QUIZ_KINDS = ("mcq", "tf")
+
+
+def _valid_quiz(kind: str, data) -> dict | None:
+    """Return a clean quiz dict, or None if the model's JSON is unusable."""
+    if not isinstance(data, dict):
+        return None
+    explanation = str(data.get("explanation") or "").strip()
+    if kind == "mcq":
+        question = str(data.get("question") or "").strip()
+        options = [str(o).strip() for o in data.get("options") or []]
+        answer = data.get("answer")
+        if (not question or len(options) != 4 or not all(options)
+                or len(set(options)) != 4 or not isinstance(answer, int)
+                or isinstance(answer, bool) or not 0 <= answer < 4):
+            return None
+        return {"kind": "mcq", "question": question, "options": options,
+                "answer": answer, "explanation": explanation}
+    statement = str(data.get("statement") or "").strip()
+    if not statement:
+        return None
+    return {"kind": "tf", "question": statement, "explanation": explanation}
+
+
+def quiz_done_from_conversation(conversation: list) -> dict[str, bool]:
+    """Which closed questions were answered correctly, read from a saved
+    conversation (quiz results are stored there, so no extra DB column)."""
+    done = {k: False for k in QUIZ_KINDS}
+    for m in conversation or []:
+        if m.get("type") == "feedback" and m.get("quiz") in done and m.get("score") == "correct":
+            done[m["quiz"]] = True
+    return done
 
 
 class StudyBuddyAgent:
@@ -125,23 +209,39 @@ class StudyBuddyAgent:
         self.concepts: dict[str, bool] = {}
         self.asked_questions: list[str] = []
         self.follow_up_count: int = 0
-        self.max_follow_ups: int = 2
-        # One entry per LLM call: {"model", "prompt_tokens", "completion_tokens"}.
-        # Kept in memory only; the app decides whether to persist it.
+        self.max_follow_ups: int = 999  # effectively unlimited; the user skips manually
+        # Concepts the student skipped; asked again once the others are done
+        self.skipped: list[str] = []
+        # Closed questions at the end of the topic
+        self.quiz_done: dict[str, bool] = {k: False for k in QUIZ_KINDS}
+        self.current_quiz: dict | None = None
         self.usage: list[dict] = []
+        # Reasoning effort per model ({model: "low" | "medium" | ...}); a model
+        # missing here is called without the parameter, i.e. its server default.
+        self.efforts: dict[str, str] = {}
 
     def _complete(self, messages: list, model: str | None = None) -> str:
         """Call the LLM, retrying when the endpoint is momentarily saturated."""
+        model = model or self.model
+        extra = {}
+        if self.efforts.get(model):
+            extra["reasoning_effort"] = self.efforts[model]
         delay = _RETRY_BASE_DELAY
         for attempt in range(_MAX_RETRIES):
             try:
                 resp = self.client.chat.completions.create(
-                    model=model or self.model,
+                    model=model,
                     messages=messages,
+                    **extra,
                 )
-                self._record_usage(model or self.model, resp)
+                self._record_usage(model, resp)
                 return resp.choices[0].message.content or ""
             except Exception as e:
+                # A level the model does not accept (misconfigured MODELS) should
+                # not break the session: retry once with the server default.
+                if extra and "reasoning" in str(e).lower() and getattr(e, "status_code", None) == 400:
+                    extra = {}
+                    continue
                 if attempt == _MAX_RETRIES - 1 or not _is_retryable(e):
                     raise
                 time.sleep(delay + random.uniform(0, 0.4))
@@ -167,7 +267,6 @@ class StudyBuddyAgent:
         )
         parsed = _parse_json(raw)
 
-        # New response shape: {is_lecture_material, topics}
         if isinstance(parsed, dict) and "is_lecture_material" in parsed:
             if not parsed["is_lecture_material"]:
                 raise ValueError(
@@ -176,13 +275,12 @@ class StudyBuddyAgent:
                     "gedacht — bitte lade ein entsprechendes Dokument hoch."
                 )
             topics = _clean_topics(parsed.get("topics") or [])
-            return topics[:8] if topics else ["Main Content"]
+            return topics[:20] if topics else ["Main Content"]
 
-        # If we got a list, clean it.
         if isinstance(parsed, list):
             topics = _clean_topics(parsed)
             if topics:
-                return topics[:8]
+                return topics[:20]
 
         # Parsing failed. Retry once with a stricter prompt.
         retry_prompt = (
@@ -201,11 +299,11 @@ class StudyBuddyAgent:
                 )
             topics = _clean_topics(parsed2.get("topics") or [])
             if topics:
-                return topics[:8]
+                return topics[:20]
         if isinstance(parsed2, list):
             topics = _clean_topics(parsed2)
             if topics:
-                return topics[:8]
+                return topics[:20]
 
         # Last resort: line-based extraction, then clean.
         for candidate in (raw2, raw):
@@ -216,9 +314,8 @@ class StudyBuddyAgent:
             ]
             topics = _clean_topics(lines)
             if topics:
-                return topics[:8]
+                return topics[:20]
 
-        # Nothing usable at all — do not block, just use a placeholder.
         return ["Main Content"]
 
     def _extract_concepts(self, topic: str, context: str) -> list[str]:
@@ -227,22 +324,39 @@ class StudyBuddyAgent:
         )
         parsed = _parse_json(raw)
         if isinstance(parsed, list):
-            concepts = [str(c).strip() for c in parsed if str(c).strip()][:5]
+            concepts = [str(c).strip() for c in parsed if str(c).strip()][:8]
             if concepts:
-                return concepts
+                return _sanitize_concepts(concepts)[:5]
         return [topic]
 
     @property
     def progress(self) -> tuple[int, int]:
-        return sum(self.concepts.values()), len(self.concepts)
+        """(done, total) over the concepts plus the closed questions."""
+        if not self.concepts:
+            return 0, 0
+        done = sum(self.concepts.values()) + sum(self.quiz_done.values())
+        return done, len(self.concepts) + len(QUIZ_KINDS)
+
+    @property
+    def concepts_complete(self) -> bool:
+        return bool(self.concepts) and all(self.concepts.values())
 
     @property
     def topic_complete(self) -> bool:
-        return bool(self.concepts) and all(self.concepts.values())
+        return self.concepts_complete and all(self.quiz_done.values())
+
+    def next_quiz_kind(self) -> str | None:
+        return next((k for k in QUIZ_KINDS if not self.quiz_done[k]), None)
 
     def _next_uncovered(self) -> str | None:
-        for concept, covered in self.concepts.items():
-            if not covered:
+        uncovered = [c for c, covered in self.concepts.items() if not covered]
+        for concept in uncovered:
+            if concept not in self.skipped:
+                return concept
+        # Only skipped concepts are left: come back to the oldest one
+        for concept in self.skipped:
+            if concept in uncovered:
+                self.skipped.remove(concept)
                 return concept
         return None
 
@@ -250,6 +364,9 @@ class StudyBuddyAgent:
         self.current_topic = topic
         self.follow_up_count = 0
         self.asked_questions = []
+        self.skipped = []
+        self.quiz_done = {k: False for k in QUIZ_KINDS}
+        self.current_quiz = None
         context = self.rag.retrieve(topic, k=4)
         self.concepts = {c: False for c in self._extract_concepts(topic, context)}
         return self._generate_question()
@@ -272,9 +389,11 @@ class StudyBuddyAgent:
     def _evaluate(self, question: str, student_answer: str, model: str | None = None) -> dict:
         """Judge an answer without touching the learning state."""
         context = self.rag.retrieve(f"{question} {student_answer}", k=5)
+        focus = self.current_concept or self.current_topic or "the material"
         prompt = EVALUATION_PROMPT.format(
             context=context,
             concepts="\n".join(f"- {c}" for c in self.concepts),
+            focus_concept=focus,
             question=question,
             answer=student_answer,
         )
@@ -285,21 +404,35 @@ class StudyBuddyAgent:
             parsed = {
                 "score": "partial",
                 "feedback": _strip_thinking(raw)[:300] or "Please try again with more detail.",
-                "follow_up": "Can you elaborate on that?",
+                "follow_up": None,
                 "missing": None,
-                "covered_concepts": [],
             }
+
         return parsed
 
     def evaluate_answer(self, student_answer: str) -> dict:
         parsed = self._evaluate(self.current_question, student_answer)
 
-        _mark_covered(self.concepts, parsed.get("covered_concepts") or [])
+        # One correct answer masters one concept: the one the question was about.
+        # Concepts the answer merely touches on are still asked about later.
         if parsed.get("score") == "correct" and self.current_concept in self.concepts:
             self.concepts[self.current_concept] = True
 
-        if self.topic_complete or self.follow_up_count >= self.max_follow_ups:
+        # No follow-ups needed once every concept is mastered
+        if self.concepts_complete:
             parsed["follow_up"] = None
+
+        # Every wrong/partial answer gets a follow-up until the concept is correct.
+        # There is no upper limit — the user can skip manually if they want.
+        # The follow-up must stay on the focus concept. The evaluator names the
+        # concept its follow-up targets; if that is not the focus concept, or
+        # there is no follow-up, a narrow prompt that only knows the focus
+        # concept writes one instead.
+        if parsed.get("score") in ("partial", "incorrect") and not self.concepts_complete:
+            follow_up = (parsed.get("follow_up") or "").strip()
+            if not follow_up or not self._is_focus(parsed.get("follow_up_concept")):
+                follow_up = self._focused_follow_up(student_answer, parsed.get("missing"))
+            parsed["follow_up"] = follow_up
 
         if parsed.get("follow_up") and parsed.get("score") in ("partial", "incorrect"):
             self.follow_up_count += 1
@@ -308,11 +441,86 @@ class StudyBuddyAgent:
 
         return parsed
 
+    def _is_focus(self, concept) -> bool:
+        focus = self.current_concept or self.current_topic or ""
+        return str(concept or "").strip().lower() == focus.strip().lower()
+
+    def _focused_follow_up(self, student_answer: str, missing) -> str:
+        """Write a follow-up about the focus concept only. Falls back to asking
+        the same question again, which is already in the material's language."""
+        concept = self.current_concept or self.current_topic or "the material"
+        context = self.rag.retrieve(f"{self.current_topic} {concept}", k=4)
+        prompt = FOLLOW_UP_PROMPT.format(
+            concept=concept,
+            question=self.current_question,
+            answer=student_answer,
+            missing=missing or "(not stated)",
+            context=context,
+        )
+        try:
+            follow_up = _strip_thinking(self._complete([{"role": "user", "content": prompt}]))
+        except Exception:
+            follow_up = ""
+        return follow_up or self.current_question
+
+    def generate_quiz(self, model: str | None = None) -> dict:
+        """Write the next closed question (multiple choice, then true/false).
+        Retries once on unusable JSON; raises ValueError if both attempts fail."""
+        kind = self.next_quiz_kind()
+        if kind is None:
+            raise ValueError("Both closed questions are already answered.")
+        # Models put the right option first and lean towards "true", so the
+        # option order and the truth of the statement are decided here.
+        truth = random.choice([True, False])
+        task = QUIZ_TASK_MCQ if kind == "mcq" else QUIZ_TASK_TF.format(truth="TRUE" if truth else "FALSE")
+        prompt = QUIZ_PROMPT.format(
+            topic=self.current_topic or "the material",
+            concepts=", ".join(self.concepts),
+            context=self.rag.retrieve(self.current_topic or "", k=5),
+            asked="\n".join(f"- {q}" for q in self.asked_questions) or "(none yet)",
+            task=task,
+        )
+        for _ in range(2):
+            quiz = _valid_quiz(kind, _parse_json(self._complete([{"role": "user", "content": prompt}], model)))
+            if quiz:
+                break
+        else:
+            raise ValueError("The model did not return a usable question.")
+        if kind == "mcq":
+            correct = quiz["options"][quiz["answer"]]
+            random.shuffle(quiz["options"])
+            quiz["answer"] = quiz["options"].index(correct)
+        else:
+            quiz["answer"] = truth
+        self.current_quiz = quiz
+        self.asked_questions.append(quiz["question"])
+        return quiz
+
+    def answer_quiz(self, choice) -> dict:
+        """Grade the open closed question: an option index, or True/False.
+        No LLM call — the right answer is known."""
+        quiz = self.current_quiz
+        if quiz is None:
+            raise ValueError("No closed question is open.")
+        correct = choice == quiz["answer"]
+        if correct:
+            self.quiz_done[quiz["kind"]] = True
+            self.current_quiz = None
+        return {"correct": correct, **quiz}
+
     def second_opinion(self, question: str, student_answer: str, model: str) -> dict:
         """Re-judge an earlier answer with another model. Display only."""
         return self._evaluate(question, student_answer, model)
 
     def next_question(self) -> str:
+        self.follow_up_count = 0
+        return self._generate_question()
+
+    def skip_question(self) -> str:
+        """Move on without counting the current concept as mastered. It is
+        asked again after the remaining concepts, so the topic stays open."""
+        if self.current_concept in self.concepts and self.current_concept not in self.skipped:
+            self.skipped.append(self.current_concept)
         self.follow_up_count = 0
         return self._generate_question()
 

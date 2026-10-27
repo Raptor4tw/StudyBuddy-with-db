@@ -59,21 +59,27 @@ def mock_llm_response(agent: StudyBuddyAgent, response: dict):
 
 # ── Correct answers ──────────────────────────────────────────────────────────
 
-def test_correct_answer_marks_concept_via_covered_concepts():
-    agent = make_agent()
-    mock_llm_response(agent, {
-        "score": "correct",
-        "feedback": "Exactly right.",
-        "follow_up": None,
-        "missing": None,
-        "covered_concepts": ["3NF definition"],
+def test_correct_answer_masters_only_the_focus_concept():
+    """Wrong answer, then a correct one: progress goes up by exactly one, even
+    if the model says the answer also touched other concepts (2/5 -> 3/5)."""
+    agent = make_agent(current_concept="C3", concepts={
+        "C1": True, "C2": True, "C3": False, "C4": False, "C5": False,
     })
+    mock_llm_response(agent, {
+        "score": "incorrect", "feedback": "No.", "follow_up": "Try C3 again?",
+        "follow_up_concept": "C3", "missing": "C3", "covered_concepts": ["C4"],
+    })
+    agent.evaluate_answer("wrong")
+    assert agent.progress == (2, 7)  # 5 concepts + 2 closed questions
 
-    result = agent.evaluate_answer("3NF removes transitive dependencies.")
-
-    assert result["score"] == "correct"
-    assert agent.concepts["3NF definition"] is True
-    assert agent.topic_complete is True
+    mock_llm_response(agent, {
+        "score": "correct", "feedback": "Yes.", "follow_up": None,
+        "missing": None, "covered_concepts": ["C3", "C4", "C5"],
+    })
+    agent.evaluate_answer("right")
+    assert agent.progress == (3, 7)
+    assert agent.concepts["C3"] is True
+    assert agent.concepts["C4"] is False
 
 
 def test_correct_answer_marks_current_concept_even_without_covered_concepts():
@@ -101,6 +107,7 @@ def test_partial_answer_sets_follow_up_and_increments_count():
         "score": "partial",
         "feedback": "You're close, but missing a detail.",
         "follow_up": "Can you give an example of a transitive dependency?",
+        "follow_up_concept": "3NF definition",
         "missing": "example of transitive dependency",
         "covered_concepts": [],
     })
@@ -135,22 +142,134 @@ def test_incorrect_offtopic_answer_does_not_cover_any_concept():
 
 # ── Follow-up limit ──────────────────────────────────────────────────────────
 
-def test_follow_up_suppressed_after_max_follow_ups_reached():
+def test_follow_ups_continue_while_concept_is_open():
+    """There is no follow-up limit any more: the student stays on the concept
+    until it is correct or they skip it."""
     agent = make_agent()
-    agent.follow_up_count = agent.max_follow_ups  # already at the limit
+    agent.follow_up_count = 10
 
     mock_llm_response(agent, {
         "score": "partial",
         "feedback": "Still not quite there.",
         "follow_up": "One more try — what makes it transitive?",
+        "follow_up_concept": "3NF definition",
         "missing": "3NF definition",
         "covered_concepts": [],
     })
 
     result = agent.evaluate_answer("Not sure.")
 
-    assert result["follow_up"] is None  # suppressed by the app.py "retry from new angle" path
-    assert agent.follow_up_count == agent.max_follow_ups  # not incremented further
+    assert result["follow_up"] == "One more try — what makes it transitive?"
+    assert agent.follow_up_count == 11
+
+
+def test_model_follow_up_and_feedback_are_kept():
+    """A good follow-up that uses other words than the concept name must not
+    be swapped for a canned text, and the model's feedback must survive."""
+    agent = make_agent(current_concept="Primärschlüssel", concepts={"Primärschlüssel": False})
+    mock_llm_response(agent, {
+        "score": "partial",
+        "feedback": "Fast: du hast Eindeutigkeit erwähnt, aber nicht NOT NULL.",
+        "follow_up": "Kannst du ein konkretes Beispiel für einen Primärschlüssel nennen?",
+        "follow_up_concept": "Primärschlüssel",
+        "missing": "NOT NULL",
+        "covered_concepts": [],
+    })
+
+    result = agent.evaluate_answer("Er ist eindeutig.")
+
+    assert result["follow_up"] == "Kannst du ein konkretes Beispiel für einen Primärschlüssel nennen?"
+    assert result["feedback"] == "Fast: du hast Eindeutigkeit erwähnt, aber nicht NOT NULL."
+
+
+def test_drifting_follow_up_is_rewritten_for_the_focus_concept():
+    """The evaluator says its follow-up is about another concept, so a narrow
+    second prompt writes one about the focus concept; the feedback stays."""
+    agent = make_agent()
+    evaluation = json.dumps({
+        "score": "partial",
+        "feedback": "You described 2NF, not 3NF.",
+        "follow_up": "What is a partial dependency in 2NF?",
+        "follow_up_concept": "2NF definition",
+        "missing": "transitive dependency",
+        "covered_concepts": [],
+    })
+    agent._complete = MagicMock(side_effect=[evaluation, "Which dependency does 3NF remove?"])
+
+    result = agent.evaluate_answer("No partial dependencies.")
+
+    assert result["follow_up"] == "Which dependency does 3NF remove?"
+    assert result["feedback"] == "You described 2NF, not 3NF."
+    assert "Focus concept: 3NF definition" in agent._complete.call_args.args[0][0]["content"]
+    assert agent.current_question == "Which dependency does 3NF remove?"
+
+
+def test_missing_follow_up_falls_back_to_the_same_question():
+    """No follow-up from the evaluator and none from the second prompt: ask the
+    same question again, which is already in the material's language."""
+    agent = make_agent(current_question="What is 3NF?")
+    evaluation = json.dumps({
+        "score": "incorrect",
+        "feedback": "That is not right.",
+        "follow_up": None,
+        "missing": "3NF definition",
+        "covered_concepts": [],
+    })
+    agent._complete = MagicMock(side_effect=[evaluation, ""])
+
+    result = agent.evaluate_answer("No idea.")
+
+    assert result["follow_up"] == "What is 3NF?"
+    assert agent.current_question == "What is 3NF?"
+
+
+def test_second_opinion_never_rewrites_the_follow_up():
+    agent = make_agent()
+    mock_llm_response(agent, {
+        "score": "partial",
+        "feedback": "Second model's view.",
+        "follow_up": "Off-focus question?",
+        "follow_up_concept": "2NF definition",
+        "missing": None,
+        "covered_concepts": [],
+    })
+
+    agent.second_opinion("What is 3NF?", "Something.", "Other-Model")
+
+    assert agent._complete.call_count == 1  # no extra follow-up call
+
+
+def test_second_opinion_returns_the_other_models_feedback():
+    agent = make_agent()
+    mock_llm_response(agent, {
+        "score": "partial",
+        "feedback": "Specific feedback from the second model.",
+        "follow_up": "Can you give an example?",
+        "missing": "example",
+        "covered_concepts": [],
+    })
+
+    result = agent.second_opinion("What is 3NF?", "Something.", "Other-Model")
+
+    assert result["feedback"] == "Specific feedback from the second model."
+
+
+def test_skip_keeps_concept_open_and_asks_it_again_later():
+    agent = make_agent(current_concept="2NF definition", concepts={
+        "1NF definition": True,
+        "2NF definition": False,
+        "3NF definition": False,
+    })
+    agent._complete = MagicMock(return_value="Next question?")
+
+    agent.skip_question()
+    assert agent.concepts["2NF definition"] is False  # skipping is not mastering
+    assert agent.current_concept == "3NF definition"  # others first
+    assert not agent.topic_complete
+
+    agent.concepts["3NF definition"] = True
+    agent.next_question()
+    assert agent.current_concept == "2NF definition"  # comes back to the skipped one
 
 
 def test_follow_up_suppressed_once_topic_is_complete():
@@ -238,3 +357,120 @@ def test_usage_recorded_per_call():
     agent.client.chat.completions.create.return_value = resp
     agent._complete([{"role": "user", "content": "hi"}], "M2")
     assert agent.usage == [{"model": "M2", "prompt_tokens": 120, "completion_tokens": 30}]
+
+
+# ── Reasoning effort ─────────────────────────────────────────────────────────
+
+def _fake_response(text="{}"):
+    resp = MagicMock()
+    resp.choices[0].message.content = text
+    resp.usage.prompt_tokens = 1
+    resp.usage.completion_tokens = 1
+    return resp
+
+
+def test_effort_sent_only_for_the_model_it_was_chosen_for():
+    agent = make_agent()
+    agent.model = "M1"
+    agent.efforts = {"M1": "high"}
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = _fake_response()
+
+    agent._complete([{"role": "user", "content": "hi"}])
+    assert agent.client.chat.completions.create.call_args.kwargs["reasoning_effort"] == "high"
+
+    agent._complete([{"role": "user", "content": "hi"}], "M2")  # e.g. a second opinion
+    assert "reasoning_effort" not in agent.client.chat.completions.create.call_args.kwargs
+
+
+def test_unsupported_effort_falls_back_to_server_default():
+    agent = make_agent()
+    agent.model = "M1"
+    agent.efforts = {"M1": "xhigh"}
+    rejected = Exception("reasoning_effort='xhigh' is not supported")
+    rejected.status_code = 400
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [rejected, _fake_response("ok")]
+
+    assert agent._complete([{"role": "user", "content": "hi"}]) == "ok"
+    assert "reasoning_effort" not in agent.client.chat.completions.create.call_args.kwargs
+
+
+# ── Closed questions at the end of a topic ───────────────────────────────────
+
+from agent.study_agent import quiz_done_from_conversation
+
+
+def _mastered_agent():
+    return make_agent(concepts={"1NF definition": True, "2NF definition": True, "3NF definition": True})
+
+
+def test_topic_needs_both_closed_questions_after_the_concepts():
+    agent = _mastered_agent()
+    assert agent.concepts_complete
+    assert not agent.topic_complete
+    assert agent.progress == (3, 5)
+    assert agent.next_quiz_kind() == "mcq"
+
+
+def test_mcq_options_are_shuffled_and_answer_follows_the_correct_option():
+    agent = _mastered_agent()
+    mock_llm_response(agent, {
+        "question": "Which dependency does 3NF remove?",
+        "options": ["Transitive", "Partial", "Multivalued", "Join"],
+        "answer": 0,
+        "explanation": "3NF removes transitive dependencies.",
+    })
+    for _ in range(20):
+        quiz = agent.generate_quiz()
+        assert quiz["options"][quiz["answer"]] == "Transitive"
+        assert sorted(quiz["options"]) == ["Join", "Multivalued", "Partial", "Transitive"]
+
+
+def test_wrong_mcq_keeps_it_open_then_correct_moves_to_true_false():
+    agent = _mastered_agent()
+    mock_llm_response(agent, {
+        "question": "Q?", "options": ["a", "b", "c", "d"], "answer": 1, "explanation": "b.",
+    })
+    quiz = agent.generate_quiz()
+    wrong = (quiz["answer"] + 1) % 4
+
+    assert agent.answer_quiz(wrong)["correct"] is False
+    assert agent.next_quiz_kind() == "mcq"  # same kind again
+
+    quiz = agent.generate_quiz()
+    assert agent.answer_quiz(quiz["answer"])["correct"] is True
+    assert agent.next_quiz_kind() == "tf"
+    assert agent.progress == (4, 5)
+
+
+def test_true_false_truth_is_decided_in_code(monkeypatch):
+    agent = _mastered_agent()
+    agent.quiz_done["mcq"] = True
+    mock_llm_response(agent, {"statement": "3NF allows transitive dependencies.", "explanation": "It removes them."})
+    monkeypatch.setattr("agent.study_agent.random.choice", lambda seq: False)
+
+    quiz = agent.generate_quiz()
+
+    assert quiz["kind"] == "tf" and quiz["answer"] is False
+    assert "FALSE according to the CONTEXT" in agent._complete.call_args.args[0][0]["content"]
+    assert agent.answer_quiz(False)["correct"] is True
+    assert agent.topic_complete
+
+
+def test_unusable_quiz_json_retries_then_raises():
+    agent = _mastered_agent()
+    agent._complete = MagicMock(return_value=json.dumps({"question": "Q?", "options": ["a", "a", "b", "c"], "answer": 0}))
+    with pytest.raises(ValueError):
+        agent.generate_quiz()
+    assert agent._complete.call_count == 2
+
+
+def test_quiz_progress_restored_from_saved_conversation():
+    conversation = [
+        {"type": "quiz", "quiz": {"kind": "mcq"}},
+        {"type": "feedback", "quiz": "mcq", "score": "incorrect"},
+        {"type": "feedback", "quiz": "mcq", "score": "correct"},
+        {"type": "feedback", "score": "correct"},  # a concept answer, not a quiz
+    ]
+    assert quiz_done_from_conversation(conversation) == {"mcq": True, "tf": False}

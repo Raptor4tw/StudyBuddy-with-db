@@ -12,9 +12,12 @@ from __future__ import annotations
 import json
 import os
 from contextlib import closing
+from datetime import timedelta
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+from tools.usage_block import current_block_start
 
 DB_URL = os.environ["SUPABASE_DB_URL"]
 
@@ -338,6 +341,58 @@ def usage_by_model(user_id: int, session_id: int) -> dict[str, tuple[int, int, i
     return {
         r["model"]: (int(r["p"] or 0), int(r["c"] or 0), int(r["peak"] or 0))
         for r in rows
+    }
+
+
+def usage_in_current_block(user_id: int, hours: float = 5) -> dict:
+    """Token usage in the user's current usage block, across all sessions.
+
+    A block opens with the first request after the previous one ended and lasts
+    `hours` (see tools/usage_block.py). Returns {"start", "resets_at", "now",
+    "per_model": {model: (prompt_tokens, completion_tokens)}}; "start" is None
+    when no block is active. Times come from the DB clock, like created_at.
+    """
+    with closing(get_connection()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT LOCALTIMESTAMP AS now")
+            now = cur.fetchone()["now"]
+            # A request that follows a gap of at least `hours` always opens a
+            # new block, so the walk only needs to start at the last such request.
+            cur.execute(
+                """SELECT created_at FROM (
+                       SELECT created_at,
+                              LAG(created_at) OVER (ORDER BY created_at, id) AS prev
+                       FROM llm_usage WHERE user_id = %s
+                   ) t
+                   WHERE prev IS NULL OR created_at - prev >= make_interval(secs => %s)
+                   ORDER BY created_at DESC
+                   LIMIT 1""",
+                (user_id, hours * 3600),
+            )
+            anchor = cur.fetchone()
+            rows = []
+            if anchor:
+                cur.execute(
+                    """SELECT created_at, model, prompt_tokens, completion_tokens
+                       FROM llm_usage
+                       WHERE user_id = %s AND created_at >= %s
+                       ORDER BY created_at, id""",
+                    (user_id, anchor["created_at"]),
+                )
+                rows = cur.fetchall()
+
+    start = current_block_start([r["created_at"] for r in rows], now, hours)
+    per_model: dict[str, tuple[int, int]] = {}
+    if start is not None:
+        for r in rows:
+            if r["created_at"] >= start:
+                p, c = per_model.get(r["model"], (0, 0))
+                per_model[r["model"]] = (p + r["prompt_tokens"], c + r["completion_tokens"])
+    return {
+        "start": start,
+        "resets_at": start + timedelta(hours=hours) if start else None,
+        "now": now,
+        "per_model": per_model,
     }
 
 

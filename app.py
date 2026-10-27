@@ -2,6 +2,7 @@ import os
 from datetime import timedelta
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -826,6 +827,21 @@ def _other_models() -> list[str]:
     return [m for m in MODEL_OPTIONS if m != current]
 
 
+def _scroll_to_latest():
+    # A rerun jumps the page back to the top; bring the newest message into view instead.
+    # The message count is part of the HTML so the script runs again for every new message.
+    components.html(
+        f"""<script>
+        // messages: {len(st.session_state.conversation)}
+        setTimeout(() => {{
+            const msgs = window.parent.document.querySelectorAll('[data-testid="stChatMessage"]');
+            if (msgs.length) msgs[msgs.length - 1].scrollIntoView({{behavior: "smooth", block: "start"}});
+        }}, 150);
+        </script>""",
+        height=0,
+    )
+
+
 def _render_model_actions():
     agent: StudyBuddyAgent = st.session_state.agent
     others = _other_models()
@@ -1159,6 +1175,7 @@ elif state in ("questioning", "feedback", "quiz", "mastered"):
     _render_conversation()
     if state in ("questioning", "feedback"):
         _render_model_actions()
+    _scroll_to_latest()
 
     if state == "questioning":
         answer = st.chat_input("Explain your understanding…", key="chat_input_answer")
